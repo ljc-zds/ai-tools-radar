@@ -103,6 +103,28 @@ class ValidateTargetTests(unittest.TestCase):
                         "bad", valid_record(field_map={"name": placeholder})
                     )
 
+    def test_rejects_credential_like_field_names_and_kit_paths(self):
+        field_maps = (
+            {"apiKey": "product.name"},
+            {"password": "product.name"},
+            {"name": "product.private_token"},
+            {"name": "submitter.session-cookie"},
+            {"authorization": "product.name"},
+        )
+        for field_map in field_maps:
+            with self.subTest(field_map=field_map):
+                with self.assertRaisesRegex(ValueError, "credential-like"):
+                    direct_submit.validate_target(
+                        "bad", valid_record(field_map=field_map)
+                    )
+
+    def test_accepts_ordinary_words_containing_credential_substrings(self):
+        normalized = direct_submit.validate_target(
+            "fixture", valid_record(field_map={"monkey": "product.author"})
+        )
+
+        self.assertEqual(normalized["field_map"], {"monkey": "product.author"})
+
     def test_rejects_invalid_headers_mapping(self):
         for headers in ([], {"": "application/json"}, {"Accept": ""}, {"Accept": 7}):
             with self.subTest(headers=headers):
@@ -659,6 +681,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("unknown target", stderr)
         self.assertNotIn("Traceback", stderr)
+        self.assertIsNone(state.current_status("submit.example.com"))
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
+
+    def test_duplicate_target_flags_are_rejected_without_side_effects(self):
+        targets, kit = self.paths()
+        with mock.patch.object(direct_submit, "submit_target") as submit:
+            code, stdout, stderr = self.run_main(
+                [
+                    "--targets",
+                    targets,
+                    "--target",
+                    "missing",
+                    "--target",
+                    "fixture",
+                    "--kit",
+                    kit,
+                ]
+            )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("exactly one --target", stderr)
+        self.assertNotIn("Traceback", stderr)
+        submit.assert_not_called()
         self.assertIsNone(state.current_status("submit.example.com"))
         self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
 

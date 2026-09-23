@@ -40,6 +40,9 @@ UNSAFE_WORKFLOWS = (
     "terms_acceptance",
 )
 PLACEHOLDERS = frozenset({"todo", "tbd", "changeme", "placeholder"})
+CREDENTIAL_TOKENS = frozenset(
+    {"password", "passwd", "secret", "token", "key", "authorization", "auth", "cookie", "session"}
+)
 ALLOWED_HEADER_NAMES = frozenset(
     {"accept", "accept-language", "content-type", "user-agent", "x-requested-with"}
 )
@@ -82,6 +85,13 @@ def _has_placeholder(value: str) -> bool:
         or (normalized.startswith("{") and normalized.endswith("}"))
         or (normalized.startswith("<") and normalized.endswith(">"))
     )
+
+
+def _has_credential_name(value: str) -> bool:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    tokens = {part.lower() for part in re.split(r"[^A-Za-z0-9]+", separated) if part}
+    compact = re.sub(r"[^a-z0-9]", "", value.lower())
+    return bool(tokens & CREDENTIAL_TOKENS) or compact in {"apikey", "authorization"}
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -131,6 +141,11 @@ def validate_target(target_id: str, record: dict) -> dict:
         or any(_has_placeholder(key) or _has_placeholder(value) for key, value in field_map.items())
     ):
         raise ValueError(f"{target_id}: complete non-empty field_map required")
+    if any(
+        _has_credential_name(remote_field) or _has_credential_name(kit_path)
+        for remote_field, kit_path in field_map.items()
+    ):
+        raise ValueError(f"{target_id}: credential-like field_map names are not allowed")
 
     headers = record["headers"]
     if not _string_mapping(headers):
@@ -339,16 +354,21 @@ def _load_json(path: str):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Submit one reviewed direct target.")
     parser.add_argument("--targets", default=str(HERE / "direct_targets.json"))
-    parser.add_argument("--target", required=True)
+    parser.add_argument("--target", required=True, action="append")
     parser.add_argument("--kit", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
+    if len(args.target) != 1:
+        print("direct-submit error: exactly one --target is required", file=sys.stderr)
+        return 2
+    target_id = args.target[0]
+
     try:
         targets = load_targets(args.targets)
-        if args.target not in targets:
-            raise ValueError(f"unknown target: {args.target}")
-        target = targets[args.target]
+        if target_id not in targets:
+            raise ValueError(f"unknown target: {target_id}")
+        target = targets[target_id]
         kit = _load_json(args.kit)
         if not isinstance(kit, dict):
             raise ValueError("kit must be a JSON object")
