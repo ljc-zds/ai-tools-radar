@@ -41,7 +41,39 @@ UNSAFE_WORKFLOWS = (
 )
 PLACEHOLDERS = frozenset({"todo", "tbd", "changeme", "placeholder"})
 CREDENTIAL_TOKENS = frozenset(
-    {"password", "passwd", "secret", "token", "key", "authorization", "auth", "cookie", "session"}
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "key",
+        "authorization",
+        "auth",
+        "cookie",
+        "session",
+        "credential",
+        "credentials",
+        "bearer",
+        "jwt",
+    }
+)
+PUBLIC_SCALAR_KIT_PATHS = frozenset(
+    {
+        "product.name",
+        "product.url",
+        "product.og_image",
+        "product.submitter.name",
+        "product.submitter.email",
+        "product.positioning.one_liner",
+        "product.facts_for_screening",
+        "product.audience_note",
+    }
+)
+PUBLIC_INDEXED_KIT_PREFIXES = (
+    "product.categories",
+    "product.tags",
+    "product.positioning.differentiators",
+    "copy.taglines",
 )
 ALLOWED_HEADER_NAMES = frozenset(
     {"accept", "accept-language", "content-type", "user-agent", "x-requested-with"}
@@ -88,10 +120,22 @@ def _has_placeholder(value: str) -> bool:
 
 
 def _has_credential_name(value: str) -> bool:
-    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", value)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", separated)
     tokens = {part.lower() for part in re.split(r"[^A-Za-z0-9]+", separated) if part}
     compact = re.sub(r"[^a-z0-9]", "", value.lower())
     return bool(tokens & CREDENTIAL_TOKENS) or compact in {"apikey", "authorization"}
+
+
+def _is_public_kit_path(value: str) -> bool:
+    if value in PUBLIC_SCALAR_KIT_PATHS:
+        return True
+    if any(
+        re.fullmatch(re.escape(prefix) + r"\.\d+", value)
+        for prefix in PUBLIC_INDEXED_KIT_PREFIXES
+    ):
+        return True
+    return re.fullmatch(r"copy\.descriptions\.[^.]+\.\d+", value) is not None
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -142,10 +186,11 @@ def validate_target(target_id: str, record: dict) -> dict:
     ):
         raise ValueError(f"{target_id}: complete non-empty field_map required")
     if any(
-        _has_credential_name(remote_field) or _has_credential_name(kit_path)
-        for remote_field, kit_path in field_map.items()
+        _has_credential_name(remote_field) for remote_field in field_map
     ):
         raise ValueError(f"{target_id}: credential-like field_map names are not allowed")
+    if any(not _is_public_kit_path(kit_path) for kit_path in field_map.values()):
+        raise ValueError(f"{target_id}: field_map must use an allowed public kit path")
 
     headers = record["headers"]
     if not _string_mapping(headers):
@@ -232,14 +277,22 @@ def build_payload(target: dict, kit: dict) -> dict[str, str]:
     """Resolve only explicitly declared dotted kit paths into form fields."""
     payload = {}
     for remote_field, dotted_path in target["field_map"].items():
+        if not _is_public_kit_path(dotted_path):
+            raise ValueError(f"field_map must use an allowed public kit path: {dotted_path}")
         value = kit
         parts = dotted_path.split(".")
         if not all(parts):
             raise ValueError(f"field_map path is invalid: {dotted_path!r}")
         for part in parts:
-            if not isinstance(value, dict) or part not in value:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            elif isinstance(value, list) and part.isdigit():
+                index = int(part)
+                if index >= len(value):
+                    raise ValueError(f"field_map path is missing: {dotted_path}")
+                value = value[index]
+            else:
                 raise ValueError(f"field_map path is missing: {dotted_path}")
-            value = value[part]
         if value is None or isinstance(value, (dict, list, tuple, set)):
             raise ValueError(f"field_map path must resolve to a scalar: {dotted_path}")
         payload[remote_field] = str(value)

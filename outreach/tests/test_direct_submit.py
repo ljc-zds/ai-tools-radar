@@ -107,9 +107,11 @@ class ValidateTargetTests(unittest.TestCase):
         field_maps = (
             {"apiKey": "product.name"},
             {"password": "product.name"},
-            {"name": "product.private_token"},
-            {"name": "submitter.session-cookie"},
             {"authorization": "product.name"},
+            {"credential": "product.name"},
+            {"credentials": "product.name"},
+            {"bearer": "product.name"},
+            {"JWTToken": "product.name"},
         )
         for field_map in field_maps:
             with self.subTest(field_map=field_map):
@@ -118,12 +120,50 @@ class ValidateTargetTests(unittest.TestCase):
                         "bad", valid_record(field_map=field_map)
                     )
 
-    def test_accepts_ordinary_words_containing_credential_substrings(self):
-        normalized = direct_submit.validate_target(
-            "fixture", valid_record(field_map={"monkey": "product.author"})
+    def test_accepts_only_public_scalar_and_indexed_kit_paths(self):
+        paths = (
+            "product.name",
+            "product.url",
+            "product.og_image",
+            "product.submitter.name",
+            "product.submitter.email",
+            "product.positioning.one_liner",
+            "product.facts_for_screening",
+            "product.audience_note",
+            "product.categories.0",
+            "product.tags.1",
+            "product.positioning.differentiators.0",
+            "copy.taglines.1",
+            "copy.descriptions.s_150.0",
         )
+        for path in paths:
+            with self.subTest(path=path):
+                normalized = direct_submit.validate_target(
+                    "fixture", valid_record(field_map={"monkey": path})
+                )
+                self.assertEqual(normalized["field_map"], {"monkey": path})
 
-        self.assertEqual(normalized["field_map"], {"monkey": "product.author"})
+    def test_rejects_non_public_kit_paths(self):
+        paths = (
+            "product.private_token",
+            "product.submitter.credential",
+            "product.submitter.credentials",
+            "product.submitter.bearer",
+            "product.submitter.JWTToken",
+            "compliance.forbidden_claims_regex.0",
+            "comment_voice.tone.0",
+            "product.unknown",
+            "product.categories",
+            "product.categories.first",
+            "copy.descriptions.s_150",
+            "copy.descriptions.s_150.first",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "public kit path"):
+                    direct_submit.validate_target(
+                        "bad", valid_record(field_map={"name": path})
+                    )
 
     def test_rejects_invalid_headers_mapping(self):
         for headers in ([], {"": "application/json"}, {"Accept": ""}, {"Accept": 7}):
@@ -387,6 +427,34 @@ class SubmitTargetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "field_map"):
                     direct_submit.build_payload({**self.target, "field_map": field_map}, self.kit)
 
+    def test_build_payload_resolves_public_list_indices(self):
+        target = {
+            **self.target,
+            "field_map": {
+                "category": "product.categories.1",
+                "description": "copy.descriptions.s_150.0",
+            },
+        }
+        kit = {
+            **self.kit,
+            "product": {**self.kit["product"], "categories": ["AI", "SaaS"]},
+            "copy": {"descriptions": {"s_150": ["Public description"]}},
+        }
+
+        self.assertEqual(
+            direct_submit.build_payload(target, kit),
+            {"category": "SaaS", "description": "Public description"},
+        )
+
+    def test_build_payload_rejects_invalid_or_out_of_range_list_indices(self):
+        kit = {**self.kit, "product": {**self.kit["product"], "categories": ["AI"]}}
+        for path in ("product.categories.first", "product.categories.2"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "field_map"):
+                    direct_submit.build_payload(
+                        {**self.target, "field_map": {"category": path}}, kit
+                    )
+
     def test_submit_sends_exact_request_once_and_records_pending_review(self):
         opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
 
@@ -567,15 +635,17 @@ class SubmitTargetTests(unittest.TestCase):
         self.assertEqual(result, {"status": "manual", "reason": "network_error"})
         self.assertEqual(len(opener.calls), 1)
 
-    def test_payload_contract_error_queues_manual_without_network_access(self):
+    def test_non_public_payload_path_is_rejected_before_claim_or_network(self):
         target = {**self.target, "field_map": {"name": "product.missing"}}
         opener = RecordingOpener(FakeResponse(url=target["endpoint"]))
 
-        result = direct_submit.submit_target(target, self.kit, opener=opener)
+        with self.assertRaisesRegex(ValueError, "public kit path"):
+            direct_submit.submit_target(target, self.kit, opener=opener)
 
-        self.assertEqual(result, {"status": "manual", "reason": "payload_contract_error"})
         self.assertEqual(len(opener.calls), 0)
-        self.assertEqual(self.pending_tasks()[0]["blocker"], "payload_contract_error")
+        self.assertIsNone(state.current_status(self.target["domain"]))
+        self.assertFalse(os.path.exists(state._claim_marker(self.target["domain"])))
+        self.assertEqual(self.pending_tasks(), [])
 
     def test_ledger_promotion_failure_is_manual_and_keeps_claim(self):
         opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
@@ -666,6 +736,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertNotIn("future-sensitive-value", stdout)
         self.assertNotIn("kit-secret", stdout)
+        self.assertIsNone(state.current_status("submit.example.com"))
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
+        self.assertEqual(state._read_jsonl(state.HUMAN_TASKS_FILE), [])
+
+    def test_dry_run_rejects_non_public_kit_path_without_side_effects(self):
+        targets, kit = self.paths(
+            [
+                {
+                    "id": "fixture",
+                    **valid_record(field_map={"name": "product.private_token"}),
+                }
+            ]
+        )
+        with mock.patch.object(direct_submit, "submit_target") as submit:
+            code, stdout, stderr = self.run_main(
+                ["--targets", targets, "--target", "fixture", "--kit", kit, "--dry-run"]
+            )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("public kit path", stderr)
+        self.assertNotIn("kit-secret", stderr)
+        submit.assert_not_called()
         self.assertIsNone(state.current_status("submit.example.com"))
         self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
         self.assertEqual(state._read_jsonl(state.HUMAN_TASKS_FILE), [])
