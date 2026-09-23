@@ -260,6 +260,67 @@ def _claim_marker(dom):
     return os.path.join(DIR, "claims", re.sub(r"[^a-z0-9.-]", "_", dom) + ".claim")
 
 
+def claim_delivery(domain, evidence="", note="", source="unknown", reason_code="unknown"):
+    """Atomically claim the only permitted outbound delivery for a domain."""
+    dom = canon_domain(domain)
+    ev, nt = _clean(evidence, 2000), _clean(note, 600)
+    marker = _claim_marker(dom)
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+
+    cur = current_status(dom)
+    frm = cur["status"] if cur else None
+    if frm in CLAIM_BLOCKING:
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(f"{frm} {now_utc()}\n")
+        except OSError:
+            pass
+        return {"claimed": False, "from": frm, "to": frm}
+
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(f"{os.getpid()} {source} {now_utc()}\n")
+    except FileExistsError:
+        return {"claimed": False, "from": frm, "to": frm}
+
+    try:
+        with_file_lock(
+            STATE_FILE,
+            lambda: _append(
+                STATE_FILE,
+                {
+                    "src": dom,
+                    "status": "delivery_ambiguous",
+                    "note": nt or "",
+                    "evidence": ev,
+                    "ts": now_utc(),
+                },
+            ),
+        )
+    except Exception:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        raise
+
+    _audit(
+        dom,
+        lambda: record_event(
+            dom,
+            "attempt_end" if frm == "delivery_ambiguous" else "status_change",
+            prev_status=frm,
+            status="delivery_ambiguous",
+            reason_code=reason_code,
+            source=source,
+            evidence={"evidence": ev, "note": nt},
+        ),
+    )
+    return {"claimed": True, "from": frm, "to": "delivery_ambiguous"}
+
+
 def release_claim(domain):
     """显式撤销认领标记 —— **只有人工裁决才该调用**。与 state.mjs 的 releaseClaim 同口径。
 

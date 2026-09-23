@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from rootdomain import host_of, same_root
+import state
 
 
 REQUIRED_FIELDS = {
@@ -33,6 +36,37 @@ UNSAFE_WORKFLOWS = (
     "terms_acceptance",
 )
 PLACEHOLDERS = frozenset({"todo", "tbd", "changeme", "placeholder"})
+CREDENTIAL_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "proxyauthorization",
+        "cookie",
+        "setcookie",
+        "xapikey",
+        "apikey",
+        "xauthtoken",
+        "authtoken",
+        "xaccesstoken",
+        "accesstoken",
+        "xsecretkey",
+        "secretkey",
+    }
+)
+RESPONSE_WALLS = (
+    (
+        "login_wall",
+        re.compile(
+            r"\b(?:log[ -]?in|sign[ -]?in|unauthorized|oauth|auth(?:entication|orization) required)\b",
+            re.I,
+        ),
+    ),
+    ("captcha_required", re.compile(r"\b(?:captcha|recaptcha|hcaptcha|turnstile)\b", re.I)),
+    ("payment_required", re.compile(r"\b(?:payment required|paid plan|upgrade (?:your )?plan|subscribe to submit)\b", re.I)),
+    (
+        "terms_acceptance_required",
+        re.compile(r"\b(?:accept|agree to) (?:the )?(?:terms|terms and conditions)\b", re.I),
+    ),
+)
 
 
 def _nonempty_string(value: object) -> bool:
@@ -56,6 +90,15 @@ def _has_placeholder(value: str) -> bool:
         or (normalized.startswith("${") and normalized.endswith("}"))
         or (normalized.startswith("{") and normalized.endswith("}"))
         or (normalized.startswith("<") and normalized.endswith(">"))
+    )
+
+
+def _credential_header(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+    return (
+        normalized in CREDENTIAL_HEADER_NAMES
+        or "authorization" in normalized
+        or normalized.endswith(("apikey", "token", "secret", "secretkey"))
     )
 
 
@@ -100,6 +143,8 @@ def validate_target(target_id: str, record: dict) -> dict:
     headers = record["headers"]
     if not _string_mapping(headers):
         raise ValueError(f"{target_id}: headers must be a string mapping")
+    if any(_credential_header(name) for name in headers):
+        raise ValueError(f"{target_id}: credential-bearing header is not allowed")
 
     statuses = record["expected_status"]
     if (
@@ -169,3 +214,108 @@ def load_targets(path: str) -> dict[str, dict]:
         target_record = {key: value for key, value in record.items() if key != "id"}
         targets[target_id] = validate_target(target_id, target_record)
     return targets
+
+
+def build_payload(target: dict, kit: dict) -> dict[str, str]:
+    """Resolve only explicitly declared dotted kit paths into form fields."""
+    payload = {}
+    for remote_field, dotted_path in target["field_map"].items():
+        value = kit
+        parts = dotted_path.split(".")
+        if not all(parts):
+            raise ValueError(f"field_map path is invalid: {dotted_path!r}")
+        for part in parts:
+            if not isinstance(value, dict) or part not in value:
+                raise ValueError(f"field_map path is missing: {dotted_path}")
+            value = value[part]
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            raise ValueError(f"field_map path must resolve to a scalar: {dotted_path}")
+        payload[remote_field] = str(value)
+    return payload
+
+
+def _queue_manual(target: dict, reason: str) -> dict:
+    state.human_task_add(
+        target["domain"],
+        url=target.get("endpoint", ""),
+        blocker=reason,
+        guidance=f"Inspect the direct submission outcome ({reason}) and resolve manually.",
+    )
+    return {"status": "manual", "reason": reason}
+
+
+def _response_values(response):
+    with response:
+        status = getattr(response, "status", None)
+        if status is None and hasattr(response, "getcode"):
+            status = response.getcode()
+        body = response.read(64_000).decode("utf-8", "replace")
+        final_url = response.geturl() if hasattr(response, "geturl") else None
+    return status, body, final_url
+
+
+def _response_wall(body: str):
+    for reason, pattern in RESPONSE_WALLS:
+        if pattern.search(body):
+            return reason
+    return None
+
+
+def submit_target(target: dict, kit: dict, *, opener=urllib.request.urlopen) -> dict:
+    """Claim and execute exactly one declared direct-submission request."""
+    try:
+        claim = state.claim_delivery(target["domain"], source="direct_submit")
+    except Exception:
+        return _queue_manual(target, "claim_error")
+    if not claim.get("claimed"):
+        return {"status": "skipped", "reason": "already_claimed"}
+
+    try:
+        payload = build_payload(target, kit)
+    except (KeyError, TypeError, ValueError):
+        return _queue_manual(target, "payload_contract_error")
+
+    headers = {**target.get("headers", {}), "Content-Type": "application/x-www-form-urlencoded"}
+    request = urllib.request.Request(
+        target["endpoint"],
+        data=urllib.parse.urlencode(payload).encode("ascii"),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        try:
+            response = opener(request, timeout=20)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        status, body, final_url = _response_values(response)
+    except Exception:
+        return _queue_manual(target, "network_error")
+
+    if final_url:
+        parsed = urllib.parse.urlparse(final_url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname or not same_root(
+            parsed.hostname, target["domain"]
+        ):
+            return _queue_manual(target, "unsafe_response_url")
+
+    wall = _response_wall(body)
+    if wall:
+        return _queue_manual(target, wall)
+    if status not in target["expected_status"]:
+        return _queue_manual(target, "unexpected_status")
+    if target["response_contains"] not in body:
+        return _queue_manual(target, "response_assertion_failed")
+
+    try:
+        written = state.upsert_submission(
+            target["domain"],
+            "pending_review",
+            source="direct_submit",
+            reason_code="submitted",
+            evidence=f"direct receipt {status}",
+        )
+    except Exception:
+        return _queue_manual(target, "ledger_write_error")
+    if not written.get("written"):
+        return _queue_manual(target, "ledger_write_error")
+    return {"status": "pending_review", "http_status": status}

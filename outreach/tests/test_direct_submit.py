@@ -5,8 +5,11 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.parse
+from unittest import mock
 
 import direct_submit
+import state
 
 
 def valid_record(**overrides):
@@ -104,6 +107,28 @@ class ValidateTargetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "headers"):
                     direct_submit.validate_target("bad", valid_record(headers=headers))
 
+    def test_rejects_credential_bearing_headers(self):
+        secret_headers = (
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "Set-Cookie",
+            "X-API-Key",
+            "API-Key",
+            "X-Auth-Token",
+            "X-Secret-Key",
+            "X-Client-Secret",
+            "Client-Secret",
+            "X-CSRF-Token",
+            "Bearer-Token",
+        )
+        for header in secret_headers:
+            with self.subTest(header=header):
+                with self.assertRaisesRegex(ValueError, "credential-bearing header"):
+                    direct_submit.validate_target(
+                        "bad", valid_record(headers={header: "must-not-be-committed"})
+                    )
+
     def test_rejects_empty_expected_status(self):
         with self.assertRaisesRegex(ValueError, "expected_status"):
             direct_submit.validate_target("bad", valid_record(expected_status=[]))
@@ -189,6 +214,252 @@ class LoadTargetsTests(unittest.TestCase):
                 path = self.write_json(document)
                 with self.assertRaises(ValueError):
                     direct_submit.load_targets(path)
+
+
+class DeliveryClaimTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.path_patches = []
+        for name, filename in (
+            ("DIR", ""),
+            ("STATE_FILE", "state.jsonl"),
+            ("EVENTS_FILE", "events.jsonl"),
+            ("HUMAN_TASKS_FILE", "human_tasks.jsonl"),
+        ):
+            value = self.tempdir.name if not filename else os.path.join(self.tempdir.name, filename)
+            patcher = mock.patch.object(state, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_claim_is_atomic_and_records_delivery_ambiguous(self):
+        first = state.claim_delivery("Submit.Example.com", source="direct_submit")
+        second = state.claim_delivery("submit.example.com", source="direct_submit")
+
+        self.assertEqual(
+            first, {"claimed": True, "from": None, "to": "delivery_ambiguous"}
+        )
+        self.assertEqual(
+            second,
+            {"claimed": False, "from": "delivery_ambiguous", "to": "delivery_ambiguous"},
+        )
+        self.assertEqual(state.current_status("submit.example.com")["status"], "delivery_ambiguous")
+
+    def test_claim_backfills_marker_for_blocking_legacy_state(self):
+        state.upsert_submission("submit.example.com", "pending_review", source="fixture")
+
+        result = state.claim_delivery("submit.example.com", source="direct_submit")
+
+        self.assertFalse(result["claimed"])
+        self.assertTrue(os.path.exists(state._claim_marker("submit.example.com")))
+
+    def test_claim_rolls_back_marker_when_guarded_ledger_write_fails(self):
+        with mock.patch.object(state, "with_file_lock", side_effect=RuntimeError("disk full")):
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                state.claim_delivery("submit.example.com", source="direct_submit")
+
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
+
+    def test_claim_keeps_marker_when_audit_write_fails(self):
+        with mock.patch.object(state, "record_event", side_effect=RuntimeError("audit full")):
+            result = state.claim_delivery("submit.example.com", source="direct_submit")
+
+        self.assertTrue(result["claimed"])
+        self.assertTrue(os.path.exists(state._claim_marker("submit.example.com")))
+        self.assertEqual(state.current_status("submit.example.com")["status"], "delivery_ambiguous")
+
+
+class FakeResponse:
+    def __init__(self, *, status=202, body=b'{"status":"queued"}', url=None):
+        self.status = status
+        self._body = body
+        self._url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, limit=-1):
+        return self._body[:limit]
+
+    def geturl(self):
+        return self._url
+
+
+class RecordingOpener:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def __call__(self, request, timeout):
+        self.calls.append((request, timeout))
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class SubmitTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        for name, filename in (
+            ("DIR", ""),
+            ("STATE_FILE", "state.jsonl"),
+            ("EVENTS_FILE", "events.jsonl"),
+            ("HUMAN_TASKS_FILE", "human_tasks.jsonl"),
+        ):
+            value = self.tempdir.name if not filename else os.path.join(self.tempdir.name, filename)
+            patcher = mock.patch.object(state, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.target = direct_submit.validate_target(
+            "fixture",
+            valid_record(headers={"Accept": "application/json", "X-Trace": "fixed"}),
+        )
+        self.kit = {
+            "product": {"name": "Signal Layer", "url": "https://signal.example/"},
+            "unmapped_secret": "do-not-send",
+        }
+
+    def pending_tasks(self):
+        return state._read_jsonl(state.HUMAN_TASKS_FILE)
+
+    def test_build_payload_uses_only_declared_dotted_paths(self):
+        payload = direct_submit.build_payload(self.target, self.kit)
+
+        self.assertEqual(
+            payload,
+            {"name": "Signal Layer", "url": "https://signal.example/"},
+        )
+
+    def test_build_payload_rejects_a_missing_or_non_scalar_path(self):
+        for field_map in (
+            {"name": "product.missing"},
+            {"product": "product"},
+        ):
+            with self.subTest(field_map=field_map):
+                with self.assertRaisesRegex(ValueError, "field_map"):
+                    direct_submit.build_payload({**self.target, "field_map": field_map}, self.kit)
+
+    def test_submit_sends_exact_request_once_and_records_pending_review(self):
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "pending_review", "http_status": 202})
+        self.assertEqual(len(opener.calls), 1)
+        request, timeout = opener.calls[0]
+        self.assertEqual(timeout, 20)
+        self.assertEqual(request.full_url, "https://api.example.com/v1/submit")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(
+            urllib.parse.parse_qs(request.data.decode("ascii")),
+            {"name": ["Signal Layer"], "url": ["https://signal.example/"]},
+        )
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("X-trace"), "fixed")
+        self.assertEqual(
+            request.get_header("Content-type"), "application/x-www-form-urlencoded"
+        )
+        self.assertEqual(state.current_status(self.target["domain"])["status"], "pending_review")
+
+    def test_second_run_skips_without_network_access(self):
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+
+        direct_submit.submit_target(self.target, self.kit, opener=opener)
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "skipped", "reason": "already_claimed"})
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_contract_mismatch_queues_manual_without_retry(self):
+        opener = RecordingOpener(
+            FakeResponse(body=b'{"status":"unknown"}', url=self.target["endpoint"])
+        )
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "response_assertion_failed"})
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(self.pending_tasks()[0]["blocker"], "response_assertion_failed")
+
+    def test_generic_200_is_not_success(self):
+        target = {**self.target, "expected_status": [200]}
+        opener = RecordingOpener(FakeResponse(status=200, body=b"OK", url=target["endpoint"]))
+
+        result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "response_assertion_failed"})
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_unexpected_status_queues_manual_without_retry(self):
+        opener = RecordingOpener(FakeResponse(status=200, url=self.target["endpoint"]))
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "unexpected_status"})
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_unsafe_final_url_queues_manual(self):
+        for final_url in ("http://api.example.com/result", "https://attacker.invalid/result"):
+            with self.subTest(final_url=final_url):
+                target = {
+                    **self.target,
+                    "domain": final_url.split("//", 1)[1].split("/", 1)[0] + ".source.example.com",
+                }
+                opener = RecordingOpener(FakeResponse(url=final_url))
+                result = direct_submit.submit_target(target, self.kit, opener=opener)
+                self.assertEqual(result, {"status": "manual", "reason": "unsafe_response_url"})
+                self.assertEqual(len(opener.calls), 1)
+
+    def test_response_walls_are_manual_even_when_positive_text_is_present(self):
+        cases = (
+            ("Please log in to continue. queued", "login_wall"),
+            ("Unauthorized: OAuth authentication is required. queued", "login_wall"),
+            ("Complete the reCAPTCHA challenge. queued", "captcha_required"),
+            ("Upgrade your paid plan to submit. queued", "payment_required"),
+            ("You must accept the terms and conditions. queued", "terms_acceptance_required"),
+        )
+        for index, (body, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                target = {**self.target, "domain": f"submit{index}.example.com"}
+                opener = RecordingOpener(
+                    FakeResponse(body=body.encode(), url=self.target["endpoint"])
+                )
+                result = direct_submit.submit_target(target, self.kit, opener=opener)
+                self.assertEqual(result, {"status": "manual", "reason": reason})
+                self.assertEqual(len(opener.calls), 1)
+
+    def test_network_error_queues_manual_without_retry(self):
+        opener = RecordingOpener(error=OSError("connection reset"))
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "network_error"})
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_payload_contract_error_queues_manual_without_network_access(self):
+        target = {**self.target, "field_map": {"name": "product.missing"}}
+        opener = RecordingOpener(FakeResponse(url=target["endpoint"]))
+
+        result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "payload_contract_error"})
+        self.assertEqual(len(opener.calls), 0)
+        self.assertEqual(self.pending_tasks()[0]["blocker"], "payload_contract_error")
+
+    def test_ledger_promotion_failure_is_manual_and_keeps_claim(self):
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+        with mock.patch.object(state, "upsert_submission", side_effect=OSError("disk full")):
+            result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "ledger_write_error"})
+        self.assertEqual(len(opener.calls), 1)
+        self.assertTrue(os.path.exists(state._claim_marker(self.target["domain"])))
+        self.assertEqual(self.pending_tasks()[0]["blocker"], "ledger_write_error")
 
 
 if __name__ == "__main__":
