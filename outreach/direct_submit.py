@@ -36,21 +36,8 @@ UNSAFE_WORKFLOWS = (
     "terms_acceptance",
 )
 PLACEHOLDERS = frozenset({"todo", "tbd", "changeme", "placeholder"})
-CREDENTIAL_HEADER_NAMES = frozenset(
-    {
-        "authorization",
-        "proxyauthorization",
-        "cookie",
-        "setcookie",
-        "xapikey",
-        "apikey",
-        "xauthtoken",
-        "authtoken",
-        "xaccesstoken",
-        "accesstoken",
-        "xsecretkey",
-        "secretkey",
-    }
+ALLOWED_HEADER_NAMES = frozenset(
+    {"accept", "accept-language", "content-type", "user-agent", "x-requested-with"}
 )
 RESPONSE_WALLS = (
     (
@@ -93,13 +80,14 @@ def _has_placeholder(value: str) -> bool:
     )
 
 
-def _credential_header(name: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
-    return (
-        normalized in CREDENTIAL_HEADER_NAMES
-        or "authorization" in normalized
-        or normalized.endswith(("apikey", "token", "secret", "secretkey"))
-    )
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Return redirect responses to the caller without contacting their target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+DEFAULT_OPENER = urllib.request.build_opener(NoRedirectHandler())
 
 
 def validate_target(target_id: str, record: dict) -> dict:
@@ -143,8 +131,13 @@ def validate_target(target_id: str, record: dict) -> dict:
     headers = record["headers"]
     if not _string_mapping(headers):
         raise ValueError(f"{target_id}: headers must be a string mapping")
-    if any(_credential_header(name) for name in headers):
-        raise ValueError(f"{target_id}: credential-bearing header is not allowed")
+    unapproved_headers = [
+        name for name in headers if name.strip().lower() not in ALLOWED_HEADER_NAMES
+    ]
+    if unapproved_headers:
+        raise ValueError(
+            f"{target_id}: allowed header names are {sorted(ALLOWED_HEADER_NAMES)}"
+        )
 
     statuses = record["expected_status"]
     if (
@@ -261,8 +254,14 @@ def _response_wall(body: str):
     return None
 
 
-def submit_target(target: dict, kit: dict, *, opener=urllib.request.urlopen) -> dict:
+def submit_target(target: dict, kit: dict, *, opener=DEFAULT_OPENER.open) -> dict:
     """Claim and execute exactly one declared direct-submission request."""
+    if not isinstance(target, dict) or not _nonempty_string(target.get("id")):
+        raise ValueError("validated target with a non-empty id required")
+    target = validate_target(
+        target["id"], {key: value for key, value in target.items() if key != "id"}
+    )
+
     try:
         claim = state.claim_delivery(target["domain"], source="direct_submit")
     except Exception:
@@ -291,13 +290,20 @@ def submit_target(target: dict, kit: dict, *, opener=urllib.request.urlopen) -> 
     except Exception:
         return _queue_manual(target, "network_error")
 
-    if final_url:
-        parsed = urllib.parse.urlparse(final_url)
-        if parsed.scheme.lower() != "https" or not parsed.hostname or not same_root(
-            parsed.hostname, target["domain"]
-        ):
-            return _queue_manual(target, "unsafe_response_url")
+    if not _nonempty_string(final_url):
+        return _queue_manual(target, "unsafe_response_url")
+    parsed = urllib.parse.urlparse(final_url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or not same_root(
+        parsed.hostname, target["domain"]
+    ):
+        return _queue_manual(target, "unsafe_response_url")
 
+    if isinstance(status, int) and 300 <= status <= 399:
+        return _queue_manual(target, "redirect_response")
+    if status in {401, 403, 407}:
+        return _queue_manual(target, "login_wall")
+    if status == 402:
+        return _queue_manual(target, "payment_required")
     wall = _response_wall(body)
     if wall:
         return _queue_manual(target, wall)

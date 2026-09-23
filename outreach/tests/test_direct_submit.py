@@ -124,10 +124,16 @@ class ValidateTargetTests(unittest.TestCase):
         )
         for header in secret_headers:
             with self.subTest(header=header):
-                with self.assertRaisesRegex(ValueError, "credential-bearing header"):
+                with self.assertRaisesRegex(ValueError, "allowed header"):
                     direct_submit.validate_target(
                         "bad", valid_record(headers={header: "must-not-be-committed"})
                     )
+
+    def test_rejects_arbitrary_unapproved_headers(self):
+        with self.assertRaisesRegex(ValueError, "allowed header"):
+            direct_submit.validate_target(
+                "bad", valid_record(headers={"X-Trace": "not-approved"})
+            )
 
     def test_rejects_empty_expected_status(self):
         with self.assertRaisesRegex(ValueError, "expected_status"):
@@ -288,6 +294,19 @@ class FakeResponse:
         return self._url
 
 
+class ResponseWithoutGeturl:
+    status = 202
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, limit=-1):
+        return b'{"status":"queued"}'[:limit]
+
+
 class RecordingOpener:
     def __init__(self, response=None, error=None):
         self.response = response
@@ -317,7 +336,7 @@ class SubmitTargetTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.target = direct_submit.validate_target(
             "fixture",
-            valid_record(headers={"Accept": "application/json", "X-Trace": "fixed"}),
+            valid_record(headers={"Accept": "application/json", "User-Agent": "DirectSubmit/1"}),
         )
         self.kit = {
             "product": {"name": "Signal Layer", "url": "https://signal.example/"},
@@ -360,7 +379,7 @@ class SubmitTargetTests(unittest.TestCase):
             {"name": ["Signal Layer"], "url": ["https://signal.example/"]},
         )
         self.assertEqual(request.get_header("Accept"), "application/json")
-        self.assertEqual(request.get_header("X-trace"), "fixed")
+        self.assertEqual(request.get_header("User-agent"), "DirectSubmit/1")
         self.assertEqual(
             request.get_header("Content-type"), "application/x-www-form-urlencoded"
         )
@@ -402,6 +421,89 @@ class SubmitTargetTests(unittest.TestCase):
 
         self.assertEqual(result, {"status": "manual", "reason": "unexpected_status"})
         self.assertEqual(len(opener.calls), 1)
+
+    def test_redirect_response_is_manual_without_followup_request(self):
+        target = {**self.target, "expected_status": [302]}
+        opener = RecordingOpener(
+            FakeResponse(status=302, body=b"queued", url=target["endpoint"])
+        )
+
+        result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "manual", "reason": "redirect_response"})
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_production_redirect_handler_refuses_redirects(self):
+        handler = direct_submit.NoRedirectHandler()
+        request = direct_submit.urllib.request.Request(self.target["endpoint"])
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://attacker.invalid/collect",
+        )
+
+        self.assertIsNone(redirected)
+        self.assertTrue(
+            any(
+                isinstance(item, direct_submit.NoRedirectHandler)
+                for item in direct_submit.DEFAULT_OPENER.handlers
+            )
+        )
+
+    def test_unvalidated_targets_are_rejected_before_claim_or_network(self):
+        cases = (
+            {"endpoint": "http://api.example.com/v1/submit"},
+            {"endpoint": "https://attacker.invalid/v1/submit"},
+            {"headers": {"Authorization": "secret"}},
+        )
+        for index, overrides in enumerate(cases):
+            with self.subTest(overrides=overrides):
+                target = {
+                    **self.target,
+                    "domain": f"unsafe{index}.example.com",
+                    **overrides,
+                }
+                opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+                with self.assertRaises(ValueError):
+                    direct_submit.submit_target(target, self.kit, opener=opener)
+                self.assertEqual(len(opener.calls), 0)
+                self.assertIsNone(state.current_status(target["domain"]))
+
+    def test_missing_final_response_url_fails_closed(self):
+        responses = (FakeResponse(url=None), ResponseWithoutGeturl())
+        for index, response in enumerate(responses):
+            with self.subTest(response=type(response).__name__):
+                target = {**self.target, "domain": f"missingurl{index}.example.com"}
+                opener = RecordingOpener(response)
+
+                result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+                self.assertEqual(
+                    result, {"status": "manual", "reason": "unsafe_response_url"}
+                )
+                self.assertEqual(len(opener.calls), 1)
+
+    def test_auth_and_payment_statuses_are_never_success(self):
+        cases = ((401, "login_wall"), (403, "login_wall"), (407, "login_wall"), (402, "payment_required"))
+        for index, (status, reason) in enumerate(cases):
+            with self.subTest(status=status):
+                target = {
+                    **self.target,
+                    "domain": f"status{index}.example.com",
+                    "expected_status": [status],
+                }
+                opener = RecordingOpener(
+                    FakeResponse(status=status, body=b"queued", url=self.target["endpoint"])
+                )
+
+                result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+                self.assertEqual(result, {"status": "manual", "reason": reason})
+                self.assertEqual(len(opener.calls), 1)
 
     def test_unsafe_final_url_queues_manual(self):
         for final_url in ("http://api.example.com/result", "https://attacker.invalid/result"):
