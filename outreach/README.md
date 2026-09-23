@@ -106,9 +106,15 @@ python3 direct_submit.py --target <id> --kit <path> --dry-run
 python3 direct_submit.py --target <id> --kit <path>
 ```
 
-测试或复核其他清单时可加 `--targets <path>`。命令每次必须且只能指定一个 `--target`，没有批量
+仅 dry-run 测试或复核其他清单时可加 `--targets <path>`；真实执行只能使用仓库内的
+`direct_targets.json`，显式传入 `--targets` 会在读取 kit 或触及账本前被拒绝。命令每次必须且只能指定一个 `--target`，没有批量
 模式；它会校验整份白名单和所选目标，并只按 `field_map` 构造 payload。dry-run 不认领、不联网、
 不写账本、也不创建人工任务。输出从不包含 headers；payload 也只显示明确映射的产品字段。
+
+真实执行先校验完整 payload，再按该域在 `state.jsonl` 的最新 UTC 时间戳执行
+`rate_limit_seconds` 限速；间隔内返回 `skipped/rate_limited`，不认领、不请求，也不创建人工任务。
+账本时间戳缺失或损坏时转人工处理，不会绕过限速。白名单 endpoint 不允许 query、路径参数或 fragment，
+成功回执状态码只允许 2xx。
 
 真实执行是一次性请求：不跟随重定向，不重试，也不回退到浏览器或 LLM。遇到登录、验证码、付费、
 条款墙、网络不确定或回执不符合已核验契约时会停止为 `manual`，必须查看 `human_tasks.jsonl` 人工

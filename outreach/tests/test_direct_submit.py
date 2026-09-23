@@ -4,10 +4,16 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 import urllib.parse
+import urllib.error
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
+from pathlib import Path
 from unittest import mock
 
 import direct_submit
@@ -75,6 +81,26 @@ class ValidateTargetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "credentials"):
             direct_submit.validate_target(
                 "bad", valid_record(endpoint="https://user:secret@api.example.com/submit")
+            )
+
+    def test_rejects_endpoint_query_path_parameters_and_fragment(self):
+        endpoints = (
+            "https://api.example.com/submit?api_key=very-secret",
+            "https://api.example.com/submit?token=very-secret",
+            "https://api.example.com/submit;token=very-secret",
+            "https://api.example.com/v1;token=very-secret/submit",
+            "https://api.example.com/submit%3Btoken=very-secret",
+            "https://api.example.com/submit#token=very-secret",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaisesRegex(ValueError, "query|path parameters|fragment"):
+                    direct_submit.validate_target("bad", valid_record(endpoint=endpoint))
+
+    def test_rejects_trimmed_field_map_key_collisions(self):
+        with self.assertRaisesRegex(ValueError, "collision"):
+            direct_submit.validate_target(
+                "bad", valid_record(field_map={"name": "product.name", " name ": "product.url"})
             )
 
     def test_rejects_non_post_method(self):
@@ -209,7 +235,7 @@ class ValidateTargetTests(unittest.TestCase):
             direct_submit.validate_target("bad", valid_record(expected_status=[]))
 
     def test_rejects_invalid_expected_status(self):
-        for statuses in ([99], [600], ["202"], [200, 202.0]):
+        for statuses in ([99], [300], [401], [429], [500], [600], ["202"], [200, 202.0]):
             with self.subTest(statuses=statuses):
                 with self.assertRaisesRegex(ValueError, "expected_status"):
                     direct_submit.validate_target(
@@ -221,12 +247,19 @@ class ValidateTargetTests(unittest.TestCase):
             direct_submit.validate_target("bad", valid_record(response_contains="  "))
 
     def test_rejects_non_positive_rate_limit(self):
-        for value in (0, -1, True, "86400"):
+        for value in (0, -1, True, "86400", float("nan"), float("inf")):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "rate_limit_seconds"):
                     direct_submit.validate_target(
                         "bad", valid_record(rate_limit_seconds=value)
                     )
+
+    def test_large_integer_rate_limit_validates_without_overflow(self):
+        limit = 10**400
+        target = direct_submit.validate_target(
+            "fixture", valid_record(rate_limit_seconds=limit)
+        )
+        self.assertEqual(target["rate_limit_seconds"], limit)
 
     def test_rejects_unknown_link_rel(self):
         with self.assertRaisesRegex(ValueError, "link_rel_expected"):
@@ -486,6 +519,8 @@ class SubmitTargetTests(unittest.TestCase):
         opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
 
         direct_submit.submit_target(self.target, self.kit, opener=opener)
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        state._append(state.STATE_FILE, {"src": self.target["domain"], "status": "draft", "ts": old})
         result = direct_submit.submit_target(self.target, self.kit, opener=opener)
 
         self.assertEqual(result, {"status": "skipped", "reason": "already_claimed"})
@@ -520,7 +555,7 @@ class SubmitTargetTests(unittest.TestCase):
         self.assertEqual(len(opener.calls), 1)
 
     def test_redirect_response_is_manual_without_followup_request(self):
-        target = {**self.target, "expected_status": [302]}
+        target = self.target
         opener = RecordingOpener(
             FakeResponse(status=302, body=b"queued", url=target["endpoint"])
         )
@@ -550,6 +585,98 @@ class SubmitTargetTests(unittest.TestCase):
                 for item in direct_submit.DEFAULT_OPENER.handlers
             )
         )
+
+    def test_production_opener_does_not_follow_loopback_redirect(self):
+        hits = {"first": 0, "second": 0}
+
+        class SecondHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits["second"] += 1
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        second = ThreadingHTTPServer(("127.0.0.1", 0), SecondHandler)
+
+        class FirstHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits["first"] += 1
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{second.server_port}/followed")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        first = ThreadingHTTPServer(("127.0.0.1", 0), FirstHandler)
+        for server in (first, second):
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join)
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            direct_submit.DEFAULT_OPENER.open(f"http://127.0.0.1:{first.server_port}/start", timeout=2)
+        caught.exception.close()
+        self.assertEqual(caught.exception.code, 302)
+        self.assertEqual(hits, {"first": 1, "second": 0})
+
+    def test_missing_public_payload_does_not_consume_claim(self):
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+        result = direct_submit.submit_target(
+            self.target, {"product": {"name": "Signal Layer", "url": None}}, opener=opener
+        )
+
+        self.assertEqual(result, {"status": "manual", "reason": "payload_contract_error"})
+        self.assertIsNone(state.current_status(self.target["domain"]))
+        self.assertFalse(os.path.exists(state._claim_marker(self.target["domain"])))
+        self.assertEqual(len(opener.calls), 0)
+        self.assertEqual(self.pending_tasks()[0]["payload"], None)
+
+    def test_recent_ledger_state_rate_limits_without_side_effects(self):
+        state.upsert_submission(self.target["domain"], "draft", source="fixture")
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result, {"status": "skipped", "reason": "rate_limited"})
+        self.assertFalse(os.path.exists(state._claim_marker(self.target["domain"])))
+        self.assertEqual(len(opener.calls), 0)
+        self.assertEqual(self.pending_tasks(), [])
+
+    def test_old_ledger_state_does_not_block_submission(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        state._append(state.STATE_FILE, {"src": self.target["domain"], "status": "draft", "ts": old})
+        opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+
+        result = direct_submit.submit_target(self.target, self.kit, opener=opener)
+
+        self.assertEqual(result["status"], "pending_review")
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_malformed_ledger_timestamp_fails_closed_before_claim(self):
+        for index, stamp in enumerate(("not-a-time", None, "2026-09-23", "2026-09-23T12:00:00+25:00")):
+            with self.subTest(stamp=stamp):
+                target = {**self.target, "domain": f"badtime{index}.example.com"}
+                state._append(state.STATE_FILE, {"src": target["domain"], "status": "draft", "ts": stamp})
+                opener = RecordingOpener(FakeResponse(url=self.target["endpoint"]))
+
+                result = direct_submit.submit_target(target, self.kit, opener=opener)
+
+                self.assertEqual(result, {"status": "manual", "reason": "invalid_ledger_timestamp"})
+                self.assertFalse(os.path.exists(state._claim_marker(target["domain"])))
+                self.assertEqual(len(opener.calls), 0)
+
+    def test_non_2xx_response_fails_closed_even_if_target_is_tampered(self):
+        target = {**self.target, "expected_status": [500]}
+        opener = RecordingOpener(FakeResponse(status=500, url=target["endpoint"]))
+        with self.assertRaisesRegex(ValueError, "expected_status"):
+            direct_submit.submit_target(target, self.kit, opener=opener)
+        self.assertFalse(os.path.exists(state._claim_marker(target["domain"])))
+        self.assertEqual(len(opener.calls), 0)
 
     def test_unvalidated_targets_are_rejected_before_claim_or_network(self):
         cases = (
@@ -591,7 +718,6 @@ class SubmitTargetTests(unittest.TestCase):
                 target = {
                     **self.target,
                     "domain": f"status{index}.example.com",
-                    "expected_status": [status],
                 }
                 opener = RecordingOpener(
                     FakeResponse(status=status, body=b"queued", url=self.target["endpoint"])
@@ -772,7 +898,7 @@ class CliTests(unittest.TestCase):
         targets, kit = self.paths()
 
         code, stdout, stderr = self.run_main(
-            ["--targets", targets, "--target", "missing", "--kit", kit]
+            ["--targets", targets, "--target", "missing", "--kit", kit, "--dry-run"]
         )
 
         self.assertNotEqual(code, 0)
@@ -827,9 +953,9 @@ class CliTests(unittest.TestCase):
     def test_malformed_kit_fails_cleanly_before_submission(self):
         targets, _ = self.paths()
         kit = self.write_json("bad-kit.json", {"product": {"name": "Signal Layer"}})
-        with mock.patch.object(direct_submit, "submit_target") as submit:
+        with mock.patch.object(direct_submit, "DEFAULT_TARGETS_PATH", Path(targets)), mock.patch.object(direct_submit, "submit_target") as submit:
             code, stdout, stderr = self.run_main(
-                ["--targets", targets, "--target", "fixture", "--kit", kit]
+                ["--target", "fixture", "--kit", kit]
             )
 
         self.assertNotEqual(code, 0)
@@ -842,14 +968,33 @@ class CliTests(unittest.TestCase):
     def test_handled_execution_result_is_json_and_returns_zero(self):
         targets, kit = self.paths()
         result = {"status": "manual", "reason": "network_error"}
-        with mock.patch.object(direct_submit, "submit_target", return_value=result):
+        with mock.patch.object(direct_submit, "DEFAULT_TARGETS_PATH", Path(targets)), mock.patch.object(direct_submit, "submit_target", return_value=result):
             code, stdout, stderr = self.run_main(
-                ["--targets", targets, "--target", "fixture", "--kit", kit]
+                ["--target", "fixture", "--kit", kit]
             )
 
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout), result)
         self.assertEqual(stderr, "")
+
+    def test_live_alternate_targets_rejected_before_kit_or_state_access(self):
+        targets, kit = self.paths()
+        with (
+            mock.patch.object(direct_submit, "load_targets", side_effect=AssertionError("targets read")),
+            mock.patch.object(direct_submit, "_load_json", side_effect=AssertionError("kit read")),
+            mock.patch.object(state, "current_status", side_effect=AssertionError("ledger read")),
+            mock.patch.object(state, "claim_delivery", side_effect=AssertionError("claim")),
+            mock.patch.object(state, "human_task_add", side_effect=AssertionError("task")),
+            mock.patch.object(direct_submit.DEFAULT_OPENER, "open", side_effect=AssertionError("network")),
+        ):
+            code, stdout, stderr = self.run_main(
+                ["--targets", targets, "--target", "fixture", "--kit", kit]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("--targets", stderr)
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
 
 
 if __name__ == "__main__":

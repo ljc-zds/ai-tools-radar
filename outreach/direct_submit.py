@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rootdomain import host_of, same_root
@@ -17,6 +19,7 @@ import state
 
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_TARGETS_PATH = HERE / "direct_targets.json"
 REQUIRED_FIELDS = {
     "domain",
     "endpoint",
@@ -175,6 +178,12 @@ def validate_target(target_id: str, record: dict) -> dict:
         raise ValueError(f"{target_id}: HTTPS endpoint required")
     if endpoint.username is not None or endpoint.password is not None:
         raise ValueError(f"{target_id}: endpoint must not contain credentials")
+    if "?" in endpoint_value:
+        raise ValueError(f"{target_id}: endpoint must not contain a query")
+    if "#" in endpoint_value:
+        raise ValueError(f"{target_id}: endpoint must not contain a fragment")
+    if endpoint.params or ";" in endpoint.path or re.search(r"%3b", endpoint.path, re.I):
+        raise ValueError(f"{target_id}: endpoint must not contain path parameters")
     if not endpoint.hostname or not same_root(endpoint.hostname, domain):
         raise ValueError(f"{target_id}: same-owner endpoint required")
 
@@ -195,6 +204,9 @@ def validate_target(target_id: str, record: dict) -> dict:
         raise ValueError(f"{target_id}: credential-like field_map names are not allowed")
     if any(not _is_public_kit_path(kit_path) for kit_path in field_map.values()):
         raise ValueError(f"{target_id}: field_map must use an allowed public kit path")
+    normalized_field_map = {key.strip(): value.strip() for key, value in field_map.items()}
+    if len(normalized_field_map) != len(field_map):
+        raise ValueError(f"{target_id}: field_map normalization collision")
 
     headers = record["headers"]
     if not _string_mapping(headers):
@@ -211,16 +223,20 @@ def validate_target(target_id: str, record: dict) -> dict:
     if (
         not isinstance(statuses, list)
         or not statuses
-        or any(type(status) is not int or not 100 <= status <= 599 for status in statuses)
+        or any(type(status) is not int or not 200 <= status <= 299 for status in statuses)
     ):
-        raise ValueError(f"{target_id}: expected_status must contain HTTP status integers")
+        raise ValueError(f"{target_id}: expected_status must contain 2xx HTTP status integers")
 
     response_contains = record["response_contains"]
     if not _nonempty_string(response_contains):
         raise ValueError(f"{target_id}: positive response assertion required")
 
     rate_limit = record["rate_limit_seconds"]
-    if type(rate_limit) not in (int, float) or rate_limit <= 0:
+    if (
+        type(rate_limit) not in (int, float)
+        or (type(rate_limit) is float and not math.isfinite(rate_limit))
+        or rate_limit <= 0
+    ):
         raise ValueError(f"{target_id}: positive rate_limit_seconds required")
 
     link_rel = record["link_rel_expected"]
@@ -242,7 +258,7 @@ def validate_target(target_id: str, record: dict) -> dict:
         "domain": domain,
         "endpoint": endpoint.geturl(),
         "method": method,
-        "field_map": {key.strip(): value.strip() for key, value in field_map.items()},
+        "field_map": normalized_field_map,
         "headers": {key.strip(): value.strip() for key, value in headers.items()},
         "expected_status": list(statuses),
         "response_contains": response_contains.strip(),
@@ -330,6 +346,29 @@ def _response_wall(body: str):
     return None
 
 
+def _rate_limit_outcome(target: dict) -> dict | None:
+    current = state.current_status(target["domain"])
+    if current is None:
+        return None
+    stamp = current.get("ts")
+    if not isinstance(stamp, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?",
+        stamp,
+    ):
+        return _queue_manual(target, "invalid_ledger_timestamp")
+    try:
+        observed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        observed = observed.astimezone(timezone.utc)
+    except ValueError:
+        return _queue_manual(target, "invalid_ledger_timestamp")
+    elapsed = (datetime.now(timezone.utc) - observed).total_seconds()
+    if elapsed < target["rate_limit_seconds"]:
+        return {"status": "skipped", "reason": "rate_limited"}
+    return None
+
+
 def submit_target(target: dict, kit: dict, *, opener=DEFAULT_OPENER.open) -> dict:
     """Claim and execute exactly one declared direct-submission request."""
     if not isinstance(target, dict) or not _nonempty_string(target.get("id")):
@@ -339,16 +378,23 @@ def submit_target(target: dict, kit: dict, *, opener=DEFAULT_OPENER.open) -> dic
     )
 
     try:
+        payload = build_payload(target, kit)
+    except (KeyError, TypeError, ValueError):
+        return _queue_manual(target, "payload_contract_error")
+
+    try:
+        limited = _rate_limit_outcome(target)
+    except Exception:
+        return _queue_manual(target, "rate_limit_state_error")
+    if limited is not None:
+        return limited
+
+    try:
         claim = state.claim_delivery(target["domain"], source="direct_submit")
     except Exception:
         return _queue_manual(target, "claim_error")
     if not claim.get("claimed"):
         return {"status": "skipped", "reason": "already_claimed"}
-
-    try:
-        payload = build_payload(target, kit)
-    except (KeyError, TypeError, ValueError):
-        return _queue_manual(target, "payload_contract_error")
 
     headers = {**target.get("headers", {}), "Content-Type": "application/x-www-form-urlencoded"}
     request = urllib.request.Request(
@@ -383,7 +429,7 @@ def submit_target(target: dict, kit: dict, *, opener=DEFAULT_OPENER.open) -> dic
     wall = _response_wall(body)
     if wall:
         return _queue_manual(target, wall)
-    if status not in target["expected_status"]:
+    if type(status) is not int or not 200 <= status <= 299 or status not in target["expected_status"]:
         return _queue_manual(target, "unexpected_status")
     if target["response_contains"] not in body:
         return _queue_manual(target, "response_assertion_failed")
@@ -410,7 +456,7 @@ def _load_json(path: str):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Submit one reviewed direct target.")
-    parser.add_argument("--targets", default=str(HERE / "direct_targets.json"))
+    parser.add_argument("--targets")
     parser.add_argument("--target", required=True, action="append")
     parser.add_argument("--kit", required=True)
     parser.add_argument("--dry-run", action="store_true")
@@ -419,10 +465,13 @@ def main(argv=None) -> int:
     if len(args.target) != 1:
         print("direct-submit error: exactly one --target is required", file=sys.stderr)
         return 2
+    if args.targets is not None and not args.dry_run:
+        print("direct-submit error: --targets is allowed only with --dry-run", file=sys.stderr)
+        return 2
     target_id = args.target[0]
 
     try:
-        targets = load_targets(args.targets)
+        targets = load_targets(args.targets or str(DEFAULT_TARGETS_PATH))
         if target_id not in targets:
             raise ValueError(f"unknown target: {target_id}")
         target = targets[target_id]
