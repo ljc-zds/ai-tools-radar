@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from rootdomain import host_of, same_root
 import state
 
 
+HERE = Path(__file__).resolve().parent
 REQUIRED_FIELDS = {
     "domain",
     "endpoint",
@@ -325,3 +329,41 @@ def submit_target(target: dict, kit: dict, *, opener=DEFAULT_OPENER.open) -> dic
     if not written.get("written"):
         return _queue_manual(target, "ledger_write_error")
     return {"status": "pending_review", "http_status": status}
+
+
+def _load_json(path: str):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Submit one reviewed direct target.")
+    parser.add_argument("--targets", default=str(HERE / "direct_targets.json"))
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--kit", required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        targets = load_targets(args.targets)
+        if args.target not in targets:
+            raise ValueError(f"unknown target: {args.target}")
+        target = targets[args.target]
+        kit = _load_json(args.kit)
+        if not isinstance(kit, dict):
+            raise ValueError("kit must be a JSON object")
+        payload = build_payload(target, kit)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"direct-submit error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        result = {"status": "validated", "target": target["id"], "payload": payload}
+    else:
+        result = submit_target(target, kit)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

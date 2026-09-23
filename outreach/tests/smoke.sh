@@ -24,6 +24,9 @@ echo "   ok"
 echo "── Python 关键路径 ──"
 python3 tests/smoke_py.py || fail=1
 
+echo "── Direct submit ──"
+python3 -m unittest tests/test_direct_submit.py -v || fail=1
+
 echo "── Node 关键路径 ──"
 node tests/smoke_js.mjs || fail=1
 

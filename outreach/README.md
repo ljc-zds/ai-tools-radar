@@ -91,6 +91,34 @@ python3 mail_sweeper.py --dry-run            # 先演一遍判定质量
 python3 mail_sweeper.py --loop               # 常驻:自动收信点验证链接
 ```
 
+## 低成本直连接口投递（实验性）
+
+`direct_submit.py` 只执行已独立核验过请求契约的确定性 POST 接口。仓库中的
+`direct_targets.json` 是源代码管理下的审核白名单，初始且当前刻意保持为空；不要把搜索结果、
+猜测出来的接口或未经复核的字段映射放进去。每条记录都必须先人工确认 endpoint、字段、成功回执、
+限速和链接 rel 契约。请求头只允许公开、静态的协议值；鉴权、cookie、token、CSRF 等秘密值
+不属于这个通道，也不得写入白名单。
+
+操作时先 dry-run，再对同一个明确目标执行一次：
+
+```bash
+python3 direct_submit.py --target <id> --kit <path> --dry-run
+python3 direct_submit.py --target <id> --kit <path>
+```
+
+测试或复核其他清单时可加 `--targets <path>`。命令每次必须且只能指定一个 `--target`，没有批量
+模式；它会校验整份白名单和所选目标，并只按 `field_map` 构造 payload。dry-run 不认领、不联网、
+不写账本、也不创建人工任务。输出从不包含 headers；payload 也只显示明确映射的产品字段。
+
+真实执行是一次性请求：不跟随重定向，不重试，也不回退到浏览器或 LLM。遇到登录、验证码、付费、
+条款墙、网络不确定或回执不符合已核验契约时会停止为 `manual`，必须查看 `human_tasks.jsonl` 人工
+调查，不能自动重投。首次认领会永久留下 `claims/<域>.claim`；即使结果不确定也不要删除 claim，
+因为请求可能已经投达。
+
+后续邮件验证仍由 Agent Mail 驱动的 `mail_sweeper.py` 处理，它只负责收信、分类和安全地点链，
+不证明公开页面已经出现链接。`pending_review`、邮件确认或接口成功回执都不算公开链接成功；只有
+`verify_link.mjs` 能核验页面上的真实链接，并在符合条件时确认 `success`。
+
 **完整闭环**：driver.py 投放 → 站点发验证邮件 → mail_sweeper.py 收信点链接 →
 state.jsonl 记 `email_verified`，卡死的 blocked 站自动回池重投；收录通过/拒绝的
 来信按 LLM 意图分类写回（pending_review/failed/skipped_badge）→ **verify_link.mjs

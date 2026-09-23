@@ -1,4 +1,6 @@
 // Node 侧关键路径冒烟(被 smoke.sh 调用)。见 smoke.sh 顶部注释。
+import { fileURLToPath } from 'node:url';
+
 const D = process.env.OUTREACH_STATE_DIR;
 const res = [];
 const t = async (name, fn) => {
@@ -35,7 +37,7 @@ await t('坏行 fail-closed', async () => {
   fs.mkdirSync(bad, { recursive: true });
   fs.writeFileSync(`${bad}/state.jsonl`, '{"src":"x.com","status":"success"');   // 截断的 success 行
   const out = execFileSync(process.execPath, ['-e', `
-    import('${new URL('../state.mjs', import.meta.url).pathname}').then(d => {
+    import('${fileURLToPath(new URL('../state.mjs', import.meta.url))}').then(d => {
       try { d.claimDelivery({ domain: 'x.com', source: 't' }); console.log('LEAKED'); }
       catch { console.log('THREW'); }
     });`], { env: { ...process.env, OUTREACH_STATE_DIR: bad }, encoding: 'utf8' }).trim();
@@ -109,7 +111,7 @@ await t('写账失败 → 标记回滚', async () => {
   const dir = `${D}/rollback`;
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(`${dir}/state.jsonl.lock`, `tok pid=${process.pid} now\n`);   // 活进程占住锁
-  const url = new URL('../state.mjs', import.meta.url).pathname;
+  const url = fileURLToPath(new URL('../state.mjs', import.meta.url));
   const out = execFileSync(process.execPath, ['-e', `
     import('${url}').then(d => {
       try { d.claimDelivery({ domain: 'x.com', source: 't' }); } catch {}
@@ -134,7 +136,7 @@ await t('审计写失败不作废状态迁移', async () => {
   const dir = `${D}/auditfail`;
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(`${dir}/events.jsonl`, { recursive: true });   // 把 events 变成目录 → append 必失败
-  const url = new URL('../state.mjs', import.meta.url).pathname;
+  const url = fileURLToPath(new URL('../state.mjs', import.meta.url));
   const out = execFileSync(process.execPath, ['-e', `
     import('${url}').then(d => {
       let r; try { r = d.upsertSubmission({ domain: 'a.com', status: 'blocked', source: 't' }); }
@@ -147,7 +149,7 @@ await t('审计写失败不作废状态迁移', async () => {
 // 注意 .gitignore **不支持行尾注释**,注释写在模式后面会让整行失效(踩过)。
 await t('claims/ 确实被 gitignore', async () => {
   const { execFileSync } = await import('node:child_process');
-  const repo = new URL('../..', import.meta.url).pathname;
+  const repo = fileURLToPath(new URL('../..', import.meta.url));
   try {
     execFileSync('git', ['check-ignore', '-q', 'outreach/claims/x.claim'], { cwd: repo });
   } catch { throw new Error('outreach/claims/ 没有被 .gitignore 忽略'); }

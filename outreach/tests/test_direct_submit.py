@@ -6,6 +6,8 @@ import os
 import tempfile
 import unittest
 import urllib.parse
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest import mock
 
 import direct_submit
@@ -562,6 +564,148 @@ class SubmitTargetTests(unittest.TestCase):
         self.assertEqual(len(opener.calls), 1)
         self.assertTrue(os.path.exists(state._claim_marker(self.target["domain"])))
         self.assertEqual(self.pending_tasks()[0]["blocker"], "ledger_write_error")
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        for name, filename in (
+            ("DIR", ""),
+            ("STATE_FILE", "state.jsonl"),
+            ("EVENTS_FILE", "events.jsonl"),
+            ("HUMAN_TASKS_FILE", "human_tasks.jsonl"),
+        ):
+            value = self.tempdir.name if not filename else os.path.join(self.tempdir.name, filename)
+            patcher = mock.patch.object(state, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_json(self, filename, value):
+        path = os.path.join(self.tempdir.name, filename)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        return path
+
+    def paths(self, records=None):
+        targets = self.write_json(
+            "targets.json",
+            {
+                "version": 1,
+                "targets": records
+                or [
+                    {
+                        "id": "fixture",
+                        **valid_record(headers={"Accept": "future-sensitive-value"}),
+                    }
+                ],
+            },
+        )
+        kit = self.write_json(
+            "kit.json",
+            {
+                "product": {
+                    "name": "Signal Layer",
+                    "url": "https://signal.example/",
+                    "private_token": "kit-secret",
+                }
+            },
+        )
+        return targets, kit
+
+    def run_main(self, argv):
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = direct_submit.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_dry_run_prints_only_declared_payload_without_side_effects(self):
+        targets, kit = self.paths()
+        with mock.patch.object(
+            direct_submit.DEFAULT_OPENER, "open", side_effect=AssertionError("network called")
+        ):
+            code, stdout, stderr = self.run_main(
+                ["--targets", targets, "--target", "fixture", "--kit", kit, "--dry-run"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "status": "validated",
+                "target": "fixture",
+                "payload": {
+                    "name": "Signal Layer",
+                    "url": "https://signal.example/",
+                },
+            },
+        )
+        self.assertEqual(stderr, "")
+        self.assertNotIn("future-sensitive-value", stdout)
+        self.assertNotIn("kit-secret", stdout)
+        self.assertIsNone(state.current_status("submit.example.com"))
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
+        self.assertEqual(state._read_jsonl(state.HUMAN_TASKS_FILE), [])
+
+    def test_unknown_target_has_no_side_effects(self):
+        targets, kit = self.paths()
+
+        code, stdout, stderr = self.run_main(
+            ["--targets", targets, "--target", "missing", "--kit", kit]
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("unknown target", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertIsNone(state.current_status("submit.example.com"))
+        self.assertFalse(os.path.exists(state._claim_marker("submit.example.com")))
+
+    def test_selected_target_requires_entire_whitelist_to_be_valid(self):
+        targets, kit = self.paths(
+            [
+                {"id": "fixture", **valid_record()},
+                {"id": "invalid-other", **valid_record(method="GET")},
+            ]
+        )
+
+        code, stdout, stderr = self.run_main(
+            ["--targets", targets, "--target", "fixture", "--kit", kit, "--dry-run"]
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("POST method required", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertIsNone(state.current_status("submit.example.com"))
+
+    def test_malformed_kit_fails_cleanly_before_submission(self):
+        targets, _ = self.paths()
+        kit = self.write_json("bad-kit.json", {"product": {"name": "Signal Layer"}})
+        with mock.patch.object(direct_submit, "submit_target") as submit:
+            code, stdout, stderr = self.run_main(
+                ["--targets", targets, "--target", "fixture", "--kit", kit]
+            )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("field_map path is missing", stderr)
+        self.assertNotIn("Traceback", stderr)
+        submit.assert_not_called()
+        self.assertIsNone(state.current_status("submit.example.com"))
+
+    def test_handled_execution_result_is_json_and_returns_zero(self):
+        targets, kit = self.paths()
+        result = {"status": "manual", "reason": "network_error"}
+        with mock.patch.object(direct_submit, "submit_target", return_value=result):
+            code, stdout, stderr = self.run_main(
+                ["--targets", targets, "--target", "fixture", "--kit", kit]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), result)
+        self.assertEqual(stderr, "")
 
 
 if __name__ == "__main__":
