@@ -83,10 +83,20 @@ class ValidateTargetTests(unittest.TestCase):
                     direct_submit.validate_target("bad", valid_record(field_map=field_map))
 
     def test_rejects_placeholder_field_mapping(self):
-        with self.assertRaisesRegex(ValueError, "field_map"):
-            direct_submit.validate_target(
-                "bad", valid_record(field_map={"name": "TODO"})
-            )
+        placeholders = (
+            "TODO",
+            "TODO: map field",
+            "YOUR_FIELD",
+            "{field}",
+            "<name>",
+            "replace-me",
+        )
+        for placeholder in placeholders:
+            with self.subTest(placeholder=placeholder):
+                with self.assertRaisesRegex(ValueError, "field_map"):
+                    direct_submit.validate_target(
+                        "bad", valid_record(field_map={"name": placeholder})
+                    )
 
     def test_rejects_invalid_headers_mapping(self):
         for headers in ([], {"": "application/json"}, {"Accept": ""}, {"Accept": 7}):
@@ -131,6 +141,9 @@ class ValidateTargetTests(unittest.TestCase):
             "account_creation",
             "captcha",
             "browser_only",
+            "login",
+            "payment",
+            "terms_acceptance",
         )
         for field in unsafe:
             with self.subTest(field=field):

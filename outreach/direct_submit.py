@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 
 from rootdomain import host_of, same_root
@@ -27,6 +28,9 @@ UNSAFE_WORKFLOWS = (
     "account_creation",
     "captcha",
     "browser_only",
+    "login",
+    "payment",
+    "terms_acceptance",
 )
 PLACEHOLDERS = frozenset({"todo", "tbd", "changeme", "placeholder"})
 
@@ -46,8 +50,12 @@ def _has_placeholder(value: str) -> bool:
     normalized = value.strip().lower()
     return (
         normalized in PLACEHOLDERS
-        or normalized.startswith("${")
-        or normalized.startswith("<placeholder")
+        or re.match(r"^(?:todo|tbd)\b", normalized) is not None
+        or re.match(r"^your(?:[_ -])", normalized) is not None
+        or re.match(r"^replace(?:[_ -]?me)\b", normalized) is not None
+        or (normalized.startswith("${") and normalized.endswith("}"))
+        or (normalized.startswith("{") and normalized.endswith("}"))
+        or (normalized.startswith("<") and normalized.endswith(">"))
     )
 
 
