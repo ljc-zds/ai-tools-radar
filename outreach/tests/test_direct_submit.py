@@ -134,7 +134,10 @@ class ValidateTargetTests(unittest.TestCase):
             "product.tags.1",
             "product.positioning.differentiators.0",
             "copy.taglines.1",
+            "copy.descriptions.xs_50.0",
             "copy.descriptions.s_150.0",
+            "copy.descriptions.m_300.0",
+            "copy.descriptions.l_510.0",
         )
         for path in paths:
             with self.subTest(path=path):
@@ -157,6 +160,8 @@ class ValidateTargetTests(unittest.TestCase):
             "product.categories.first",
             "copy.descriptions.s_150",
             "copy.descriptions.s_150.first",
+            "copy.descriptions.credentials.0",
+            "copy.descriptions.private_token.0",
         )
         for path in paths:
             with self.subTest(path=path):

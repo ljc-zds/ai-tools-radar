@@ -74,6 +74,10 @@ PUBLIC_INDEXED_KIT_PREFIXES = (
     "product.tags",
     "product.positioning.differentiators",
     "copy.taglines",
+    "copy.descriptions.xs_50",
+    "copy.descriptions.s_150",
+    "copy.descriptions.m_300",
+    "copy.descriptions.l_510",
 )
 ALLOWED_HEADER_NAMES = frozenset(
     {"accept", "accept-language", "content-type", "user-agent", "x-requested-with"}
@@ -135,7 +139,7 @@ def _is_public_kit_path(value: str) -> bool:
         for prefix in PUBLIC_INDEXED_KIT_PREFIXES
     ):
         return True
-    return re.fullmatch(r"copy\.descriptions\.[^.]+\.\d+", value) is not None
+    return False
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
