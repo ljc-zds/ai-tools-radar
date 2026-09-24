@@ -125,6 +125,27 @@ python3 direct_submit.py --target <id> --kit <path>
 不证明公开页面已经出现链接。`pending_review`、邮件确认或接口成功回执都不算公开链接成功；只有
 `verify_link.mjs` 能核验页面上的真实链接，并在符合条件时确认 `success`。
 
+## 受控工作流
+
+低成本直连必须按以下顺序推进，发现机会不会自动进入生产白名单：
+
+```bash
+python3 workflow.py discover --input candidates.json --out opportunities.json
+python3 workflow.py review --opportunities opportunities.json
+python3 workflow.py approve --opportunities opportunities.json --target <id>
+python3 direct_submit.py --target <id> --kit kit.json --dry-run
+python3 direct_submit.py --target <id> --kit kit.json
+python3 mail_sweeper.py --dry-run
+python3 mail_sweeper.py --loop
+node verify_link.mjs --pending --update-status
+```
+
+`discover` 只记录候选；`review` 要求独立确认公开提交契约，只有 `qualified` 记录才能由
+`approve` 写入 `direct_targets.json`。真实执行一次只允许一个 target，先 dry-run 再执行。
+邮件核验只表示站方邮件流程完成，不能替代公开页面核验；最终只有 `verify_link.mjs` 能把
+真实存在且符合 rel 条件的公开链接确认成成功。当前 `direct_targets.json` 为空是刻意的，
+必须经过上述门控后才会增加记录。
+
 **完整闭环**：driver.py 投放 → 站点发验证邮件 → mail_sweeper.py 收信点链接 →
 state.jsonl 记 `email_verified`，卡死的 blocked 站自动回池重投；收录通过/拒绝的
 来信按 LLM 意图分类写回（pending_review/failed/skipped_badge）→ **verify_link.mjs

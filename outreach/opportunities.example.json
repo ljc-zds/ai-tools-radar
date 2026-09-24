@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "opportunities": [
+    {
+      "id": "reviewed-directory-id",
+      "domain": "directory.example",
+      "source": "independent contract inspection",
+      "listing_url": "https://directory.example/",
+      "evidence": ["public form inspected", "positive receipt captured"],
+      "contract": {
+        "domain": "directory.example",
+        "endpoint": "https://directory.example/submit",
+        "method": "POST",
+        "field_map": {
+          "name": "product.name",
+          "url": "product.url",
+          "description": "copy.descriptions.m_300.0",
+          "email": "product.submitter.email"
+        },
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "expected_status": [202],
+        "response_contains": "queued",
+        "rate_limit_seconds": 86400,
+        "link_rel_expected": "nofollow"
+      }
+    }
+  ]
+}
