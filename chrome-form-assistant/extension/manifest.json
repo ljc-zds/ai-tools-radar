@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "外链助手",
+  "version": "0.6.0",
+  "description": "分析博客与目录表单，自动填写提交，识别结果并防止重复提交。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://cubapi.codemao.cn/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开表单助手"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "minimum_chrome_version": "116",
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "optional_permissions": []
+}
