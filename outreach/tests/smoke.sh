@@ -23,6 +23,7 @@ echo "   ok"
 
 echo "── Python 关键路径 ──"
 python3 tests/smoke_py.py || fail=1
+python3 -m unittest discover -s tests -p 'test_comment_watch.py' || fail=1
 
 echo "── Direct submit ──"
 python3 -m unittest tests/test_direct_submit.py -v || fail=1

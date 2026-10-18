@@ -68,5 +68,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("verify_link.mjs", workflow.next_steps("valid")["success_rule"])
 
 
+def contract():
+    return {
+        "domain": "directory.example",
+        "endpoint": "https://directory.example/submit",
+        "method": "POST",
+        "field_map": {"name": "product.name"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "expected_status": [202],
+        "response_contains": "queued",
+        "rate_limit_seconds": 86400,
+        "link_rel_expected": "nofollow",
+    }
+
+
+class LocalWorkflowTests(unittest.TestCase):
+    def test_discover_stays_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.json"
+            out = Path(tmp) / "opportunities.json"
+            source.write_text(json.dumps([{"id": "one", "domain": "directory.example", "source": "manual"}]))
+            result = workflow.discover(source, out)
+            self.assertEqual(result["opportunities"][0]["status"], "candidate")
+
+    def test_review_requires_contract_and_qualifies_valid_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "opportunities.json"
+            path.write_text(json.dumps({"version": 1, "opportunities": [
+                {"id": "missing", "domain": "directory.example", "status": "candidate"},
+                {"id": "ready", "domain": "directory.example", "status": "candidate", "contract": contract()},
+            ]}))
+            result = workflow.review(path, path)
+            statuses = {row["id"]: row["status"] for row in result["opportunities"]}
+            self.assertEqual(statuses, {"missing": "needs_contract", "ready": "qualified"})
+
+    def test_approve_only_qualified_target_changes_whitelist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opportunities = Path(tmp) / "opportunities.json"
+            targets = Path(tmp) / "targets.json"
+            opportunities.write_text(json.dumps({"version": 1, "opportunities": [
+                {"id": "ready", "domain": "directory.example", "status": "qualified", "contract": contract()}
+            ]}))
+            targets.write_text(json.dumps({"version": 1, "targets": []}))
+            added = workflow.approve(opportunities, "ready", targets)
+            self.assertEqual(added["id"], "ready")
+            self.assertEqual(len(json.loads(targets.read_text())["targets"]), 1)
+
+    def test_next_steps_keeps_mail_and_public_verification_separate(self):
+        result = workflow.next_steps("ready")
+        stages = [step["stage"] for step in result["steps"]]
+        self.assertEqual(stages, ["dry_run", "execute_one", "mail_verification", "public_verification"])
+        self.assertIn("verify_link.mjs", result["success_rule"])
+
+
+
 if __name__ == "__main__":
     unittest.main()
