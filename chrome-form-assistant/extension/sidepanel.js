@@ -160,17 +160,18 @@ async function saveCollected(raw, rows) {
     return {website,added,total:links.size};
   });
 }
-async function discoveryRequest(path, data, pairingToken = null) {
+async function discoveryRequest(path, data, pairingToken = null, cancelSignal = null) {
   const token = pairingToken || localStorage.getItem('codexBridgeToken');
   if (!token) throw Error('请先在设置中启用 Codex CLI 本机桥接。');
   let response;
   try {
     response = await fetch('http://127.0.0.1:8795/'+path,{method:'POST',
       headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
-      body:JSON.stringify(data),credentials:'omit',redirect:'error',signal:AbortSignal.timeout(path==='health'?5000:110000)});
-  } catch(error) {throw Error(error.name==='TimeoutError'?'等待本机桥接响应超时；外链已保存，请检查桥接终端后继续。':'无法连接本机桥接。请启动新版桥接并核对配对码。');}
+      body:JSON.stringify(data),credentials:'omit',redirect:'error',signal:cancelSignal?AbortSignal.any([cancelSignal,AbortSignal.timeout(path==='health'?5000:110000)]):AbortSignal.timeout(path==='health'?5000:110000)});
+  } catch(error) {if(error.name==='TimeoutError')throw Object.assign(Error('本机桥接响应超时，已跳过当前网站。'),{analysisTimeout:true});throw Error(cancelSignal?.aborted?'已停止分析':'无法连接本机桥接。请启动新版桥接并核对配对码。');}
   if(path==='health' && [400,404].includes(response.status))throw Error('桥接版本过旧，请关闭旧桥接终端并启动新版，再重新保存配对码。');
   const result = await response.json().catch(()=>null);
+  if(response.status===504)throw Object.assign(Error('Codex 判断超时，已跳过当前网站。'),{analysisTimeout:true});
   if (!response.ok || result?.error) throw Error(result?.error || ({
     403:'配对失败，请重新保存桥接配对码。',404:'请重启为新版桥接。',429:'桥接正在处理另一项任务。',504:'Codex CLI 在 100 秒内没有返回结果。外链已保存；请检查 CLI 网络或模型可用性后继续，此步骤不需要 CDP。'
   }[response.status] || '桥接未返回可用结果，请检查本机终端。'));

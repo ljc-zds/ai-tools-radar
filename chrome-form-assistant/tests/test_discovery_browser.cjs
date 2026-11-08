@@ -281,6 +281,17 @@ let chrome,ws;
    }
    console.log('PASS: collect/publish/library/settings fit narrow and wide viewports; previews saved');
  }
+ const cancelledVisit=await evaluate(`(async()=>{
+   const read=readBlogPage,remove=chrome.tabs.remove;let stopped=false,closed=0;
+   readBlogPage=()=>{setTimeout(()=>{stopped=true;},30);return new Promise(()=>{});};
+   chrome.tabs.remove=async()=>{closed++;};
+   const started=Date.now();let message;
+   try{await visitBlog('https://stalled.test/article',()=>stopped);}catch(error){message=error.message;}
+   finally{readBlogPage=read;chrome.tabs.remove=remove;}
+   return {message,closed,elapsed:Date.now()-started,live:scanLive.has('https://stalled.test/article')};
+ })()`);
+ assert.match(cancelledVisit.message,/已停止/);assert.equal(cancelledVisit.closed,1);assert.equal(cancelledVisit.live,false);assert(cancelledVisit.elapsed<5000);
+ console.log('PASS: stopping a stalled real analysis workflow releases the tab and progress entry');
  assert.equal(errors.length,0,JSON.stringify(errors));
  console.log('PASS: DOM initialization, auto analysis, recursion, filters, persistence, batch stop on unknown and duplicate prevention');console.log(shotPath);
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>{ws?.close();chrome?.kill();server.close();});

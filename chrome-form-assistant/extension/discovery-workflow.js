@@ -14,7 +14,7 @@ function renderScanProgress(){
   const running=scanJobs.filter(j=>j.state==='running');
   const excluded=scanJobs.filter(j=>j.state==='done'&&(j.excluded||URLTools.searchResultReason(j.url))).length;
   const lines=[`已处理 ${done} / ${scanJobs.length} · 其中排除 ${excluded} · 失败 ${failed} · 同时分析 ${running.length} 个`];
-  if(scanStopped)lines.push('正在停止；已开始的请求结束后保存结果。');
+  if(scanStopped)lines.push('正在停止等待；已保存的结果保留。');
   for(const job of running){
     const live=scanLive.get(job.url),index=scanJobs.indexOf(job)+1;
     lines.push(`第 ${index} / ${scanJobs.length} 个 · ${live?.stage||'准备分析'} · ${live?Math.floor((Date.now()-live.started)/1000):0} 秒\n${job.url}`);
@@ -31,6 +31,24 @@ function scanEntries(rows,remaining){
   $('scanPlan').textContent=`本次选取 ${plan.selected.length} 页；合并或暂缓 ${plan.skipped.length} 页（原始网址保留）。`;
   return plan.selected.map(row=>({url:URLTools.canonicalURL(row.url),remaining}));
 }
+// Bound every awaited operation, including Chrome APIs that may never settle.
+function analysisBudget(stopped,totalMs=180000){
+  const deadline=Date.now()+totalMs,controller=new AbortController();
+  let failure;
+  const stop=()=>stopped()||controller.signal.aborted;
+  const run=(action,ms,label)=>new Promise((resolve,reject)=>{
+    let settled=false;
+    const finish=(fn,value)=>{if(settled)return;settled=true;clearInterval(poll);clearTimeout(timer);fn(value);};
+    const fail=message=>{failure=failure||Object.assign(Error(message),{analysisTimeout:!stopped(),fatal:true});controller.abort();finish(reject,failure);};
+    const check=()=>{if(stop())fail(stopped()?'已停止分析':failure?.message||'分析已终止');else if(Date.now()>=deadline)fail('单网站分析超过 180 秒，已跳过');};
+    const poll=setInterval(check,100);
+    const remaining=deadline-Date.now();
+    const timer=setTimeout(()=>fail(remaining<=ms?'单网站分析超过 180 秒，已跳过':label+'超时，已跳过'),Math.max(0,Math.min(ms,remaining)));
+    check();if(settled)return;
+    Promise.resolve().then(()=>{if(stop())throw failure||Error('已停止分析');return action();}).then(value=>{check();finish(resolve,value);},error=>finish(reject,error));
+  });
+  return {run,stopped:stop,signal:controller.signal,close:()=>controller.abort()};
+}
 async function visitBlog(url,isStopped){
   const excludedResult=(reason,finalUrl=url)=>({verdict:'unknown',excluded:true,reason,finalUrl,hasCommentForm:false,captcha:false,sites:[],linkMethods:[],linkSamples:[]});
   const initialReason=URLTools.searchResultReason(url);
@@ -40,12 +58,14 @@ async function visitBlog(url,isStopped){
   const progress=()=>{scanLive.set(url,{stage,started});renderScanProgress();};
   const timer=setInterval(progress,1000);progress();
   let tab;
+  const budget=analysisBudget(isStopped);
+  const limited=budget.run;
   try{
-    tab=await chrome.tabs.create({url,active:false});
+    tab=await limited(async()=>{const created=await chrome.tabs.create({url,active:false});if(budget.stopped()){chrome.tabs.remove(created.id).catch(()=>{});throw Error('已停止分析');}return created;},10000,'创建分析网页');
     let ready=false;
     for(let i=0;i<80;i++){
       if(isStopped())throw Error('已停止');
-      const current=await chrome.tabs.get(tab.id);
+      const current=await limited(()=>chrome.tabs.get(tab.id),5000,'读取网页加载状态');
       const redirectReason=URLTools.searchResultReason(current.url);
       if(redirectReason)return excludedResult('来源页跳转到了'+redirectReason,current.url);
       if(current.status==='complete'){ready=true;break;}
@@ -55,11 +75,11 @@ async function visitBlog(url,isStopped){
     await nap(1500);
     if(isStopped())throw Error('已停止');
     stage='正在读取评论与表单';progress();
-    const initialPage=await readBlogPage(tab.id);
+    const initialPage=await limited(()=>readBlogPage(tab.id),15000,'读取评论与表单');
     if(!initialPage?.evidence)throw Error('无法读取页面证据');
     const finalReason=URLTools.searchResultReason(initialPage.url);
     if(finalReason)return excludedResult('来源页跳转到了'+finalReason,initialPage.url);
-    const page=await collectCommentPages(tab.id,initialPage,isStopped,value=>{stage=value;progress();});
+    const page=await limited(()=>collectCommentPages(tab.id,initialPage,budget.stopped,value=>{if(!budget.stopped()){stage=value;progress();}},limited),60000,'评论采集');
     const comments=`保存 ${page.items.length} 条评论；${page.commentCollection?.reason||''}`;
     if(isStopped())throw Error('已停止');
     let result;
@@ -67,8 +87,8 @@ async function visitBlog(url,isStopped){
       comments:page.items.slice(0,30).map(item=>({text:(item.text||'').slice(0,600),links:(item.links||[]).slice(0,8)})),
       collectedComments:page.items.length,collection:page.commentCollection||null};
     stage='正在等待 Codex CLI 判断（单次最多 100 秒）';progress();
-    try{result=await discoveryRequest('draft',{mode:'assess_blog',evidence:page.evidence});}
-    catch(error){error.bridgeFailure=true;throw error;}
+    try{result=await limited(()=>discoveryRequest('draft',{mode:'assess_blog',evidence:page.evidence},null,budget.signal),110000,'Codex 判断');}
+    catch(error){if(!error.analysisTimeout&&!budget.stopped())error.bridgeFailure=true;throw error;}
     const verdict=commentEligibility(page.evidence,result.verdict);
     const quality=PageQuality.assess(page.evidence,result.quality);
     const origin=new URL(page.url).hostname.replace(/^www\./,'');
@@ -77,7 +97,7 @@ async function visitBlog(url,isStopped){
     }))];
     return {verdict,excluded:false,reason:verdict==='link_unverified'?'发现可留言表单，未发现登录或验证码要求；提交按钮可能等待填写必填项，提交和留链效果仍待验证。':String(result.reason||'').slice(0,300),captcha:page.evidence.forms.some(f=>f.captcha),
       topics:ResourceTopics.normalize(result.topics),quality,hasCommentForm:page.evidence.forms.length>0,frameCoverage:page.evidence.frameCoverage,formEvidence:page.evidence.forms,manualFillRequired:!page.evidence.forms.some(f=>f.comment&&f.submit&&!f.captcha&&f.website&&!f.custom&&!f.frameId),linkMethods:page.evidence.linkMethods||[],linkSamples:page.items.flatMap(item=>item.links||[]).slice(0,50),commentCollection:page.commentCollection,embeddedComments:page.evidence.embeddedComments,sites,comments,finalUrl:URLTools.canonicalURL(page.url)};
-  }finally{clearInterval(timer);scanLive.delete(url);if(tab)await chrome.tabs.remove(tab.id).catch(()=>{});}
+  }finally{budget.close();clearInterval(timer);scanLive.delete(url);if(tab)chrome.tabs.remove(tab.id).catch(()=>{});}
 }
 async function afterCollection(rows){
   const rounds=Number($('recursionRounds').value);
@@ -157,7 +177,7 @@ function initDiscovery(){
   $('scanConcurrency').onchange=()=>localStorage.setItem('scanConcurrency',$('scanConcurrency').value);
   $('recursionRounds').value=localStorage.getItem('recursionRounds')||'0';
   $('recursionRounds').onchange=()=>localStorage.setItem('recursionRounds',$('recursionRounds').value);
-  $('stopDiscovery').onclick=()=>{scanStopped=true;scanner.stop();$('scanStatus').textContent='正在停止；当前已发出的模型请求结束后暂停。';};
+  $('stopDiscovery').onclick=()=>{scanStopped=true;scanner.stop();$('scanStatus').textContent='正在停止等待；已保存的评论和结果保留。桥接中已启动的模型任务可能仍需自行结束。';};
   $('resumeDiscovery').onclick=()=>{
     if(busy)return;
     const permission=chrome.permissions.request({origins:['https://*/*','http://*/*']});

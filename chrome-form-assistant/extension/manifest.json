@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "外链助手",
-  "version": "0.11.11",
+  "version": "0.11.12",
   "description": "分析博客与目录表单，自动填写提交，识别结果并防止重复提交。",
   "permissions": [
     "activeTab",

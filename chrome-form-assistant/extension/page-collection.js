@@ -87,21 +87,24 @@ async function collectReportPages(tabId,first,recursive){
   return {...first,rows:[...rows.values()],capture:{...metadata,added,total:lastSaved?.total||0}};
 }
 
-async function collectCommentPages(tabId,first,isStopped,onStage){
+async function collectCommentPages(tabId,first,isStopped,onStage,limited=action=>action()){
+  const guard=()=>{if(isStopped())throw Object.assign(Error('已停止评论采集'),{fatal:true});};
   const all=new Map();let metadata,latest=first;
   const read=async()=>{
-    const result=await readBlogPage(tabId);
+    guard();onStage('正在读取翻页后的评论');
+    const result=await limited(()=>readBlogPage(tabId),15000,'读取评论页');guard();
     if(!result?.items)throw Error('评论尚未加载');latest=result;return result;
   };
   try{
     metadata=await PageCollection.run({first,read,maxPages:Number($('commentPageLimit').value),stopped:isStopped,
       signature:page=>JSON.stringify(page.items.map(item=>[item.text,item.sites])),
-      advance:async()=>{const [{result}]=await chrome.scripting.executeScript({target:{tabId},func:advanceCollection,args:['comments']});return result;},
+      advance:async()=>{guard();onStage('正在查找并展开下一批评论');const [{result}]=await limited(()=>chrome.scripting.executeScript({target:{tabId},func:advanceCollection,args:['comments']}),10000,'展开评论');guard();return result;},
       save:async(page,count)=>{
+        guard();onStage('正在保存评论');
         page.items.forEach(item=>all.set(JSON.stringify([item.text,item.sites]),item));
-        await saveBlogComments(page);onStage(`已保存 ${count} 页/批评论，累计 ${all.size} 条`);
+        await limited(()=>saveBlogComments(page),15000,'保存评论');guard();onStage(`已保存 ${count} 页/批评论，累计 ${all.size} 条`);
       }});
-  }catch(error){metadata={reason:'评论采集暂停：'+error.message};}
+  }catch(error){if(error.fatal||isStopped())throw error;metadata={reason:'评论采集暂停：'+error.message};}
   const methods=new Set(latest.evidence?.linkMethods||[]);
   if([...all.values()].some(item=>item.links?.length))methods.add('existing_body_links');
   return {...latest,evidence:{...latest.evidence,linkMethods:[...methods]},items:[...all.values()],commentCollection:metadata};
