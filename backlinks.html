@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>外链收集 · AI Tools Radar</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#15243b;font:15px/1.6 system-ui,sans-serif}
+main{max-width:930px;margin:auto;padding:28px 18px}a{color:#184ec7;overflow-wrap:anywhere}
+section{background:white;border:1px solid #dae2ef;border-radius:14px;padding:18px;margin:16px 0}
+input,textarea,button{font:inherit;padding:9px;border:1px solid #aabbd6;border-radius:8px}
+input,textarea{width:100%}button{background:#174ab7;color:white;cursor:pointer;margin:8px 4px 0 0}
+button:disabled{opacity:.55;cursor:default}textarea{min-height:105px;resize:vertical}
+li{margin:.65em 0}small{color:#4b5d75}h1,h2{margin:0 0 8px}
+</style>
+<main>
+  <a href="./">← AI Tools Radar</a>
+  <h1>外链收集</h1>
+  <p>按目标网站整理反链来源页。点击来源页后，可在 Edge 打开外链助手填写。</p>
+  <section>
+    <form id="collect">
+      <label for="target">目标网站（域名或网址）</label>
+      <input id="target" required placeholder="example.com" maxlength="4000">
+      <button id="lookup" type="button">查询本地快照</button>
+      <a href="https://ahrefs.com/backlink-checker" target="_blank" rel="noopener noreferrer">打开 Ahrefs 免费检查器 ↗</a>
+      <p><label for="sources">补充来源页：每行一个来源网址，或粘贴 Ahrefs API 返回的 JSON</label></p>
+      <textarea id="sources" maxlength="2000000" placeholder="https://blog.example.org/article"></textarea>
+      <button type="submit">添加到此网站</button>
+    </form>
+    <p id="status" role="status"></p>
+    <small>本地快照每域最多 100 条，可能已过期。收集结果不代表网站允许投稿或评论。</small>
+  </section>
+  <section>
+    <h2>已收集的网站</h2>
+    <button id="export" disabled>导出外链助手 JSON</button>
+    <div id="groups"></div>
+    <p><small>导出后，在外链助手的「本地外链 → 选择文件」导入。也可以直接打开下方来源页，再用侧栏填写。</small></p>
+  </section>
+</main>
+<script src="chrome-form-assistant/extension/url-utils.js"></script>
+<script src="backlinks.js"></script>
+</html>

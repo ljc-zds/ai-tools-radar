@@ -10,6 +10,9 @@ class ExtensionPackage(unittest.TestCase):
         extension = root / 'extension'
         expected = {'manifest.json', 'background.js', 'content.js',
                     'sidepanel.html', 'sidepanel.js', 'style.css', 'local-api.js', 'catalog-worker.js', 'url-utils.js', 'autofill.js', 'products.json'}
+        expected.update({'ahrefs-capture.js','blog-capture.js','semrush-capture.js','link-risk.js'})
+        expected.update({'blog-queue.js','discovery-workflow.js','library-workflow.js','target-context.js','page-collection.js'})
+        expected.update(f'icon{size}.png' for size in (16, 32, 48, 128))
         self.assertEqual({p.name for p in extension.iterdir()}, expected)
         self.assertFalse((root / 'manifest.json').exists())
         for path in extension.rglob('*'):

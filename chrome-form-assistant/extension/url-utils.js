@@ -21,5 +21,18 @@
     }
     return url.protocol + '//' + url.host + path + (search.length ? '?' + search.join('&') : '');
   }
-  globalThis.URLTools = Object.freeze({canonicalURL});
+  function searchResultReason(raw) {
+    try {
+      const u=new URL(raw),host=u.hostname.toLowerCase(),path=u.pathname;
+      if(!['http:','https:'].includes(u.protocol))return '';
+      const yahoo=/(^|\.)search\.yahoo\.com$/.test(host);
+      const google=/^(www\.)?google\.(com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})$/.test(host)&&/^\/search\/?$/.test(path);
+      const bing=/^(www\.|cn\.)?bing\.com$/.test(host)&&/^\/search\/?$/.test(path);
+      const baidu=/^(www\.|m\.)?baidu\.com$/.test(host)&&/^\/(s|from)\/?$/.test(path);
+      const duck=/^(www\.|html\.|lite\.)?duckduckgo\.com$/.test(host)&&u.searchParams.has('q');
+      const yandex=/^(www\.)?yandex\.(com|ru)$/.test(host)&&/^\/search\/?$/.test(path);
+      return yahoo||google||bing||baidu||duck||yandex?'搜索引擎结果页，不作为博客评论资源':'';
+    } catch {return '';}
+  }
+  globalThis.URLTools = Object.freeze({canonicalURL,searchResultReason});
 })();

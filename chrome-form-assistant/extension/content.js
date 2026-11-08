@@ -131,7 +131,7 @@
     if(commentNodes().some(node=>normalize(node.innerText).includes(body)|| (websiteValue && [...node.querySelectorAll('a[href]')].some(a=>{try{return new URL(a.href).hostname===new URL(websiteValue).hostname;}catch{return false;}}))))throw Error('评论区已有相同内容或产品网站，已阻止重复提交。');
     const values=[...form.elements].map(el=>[el,el.value,el.checked]);
     submitTicket={id:uid(),form,button,values,action:form.action,buttonAction:button.getAttribute('formaction'),method:form.method};
-    return {ticket:submitTicket.id,probe:{body,mode:payload.mode,sourcePath:location.pathname,notices:noticeNodes().map(el=>normalize(el.innerText)),baseline:commentNodes().map(node=>node.id).filter(Boolean)}};
+    return {ticket:submitTicket.id,probe:{body,website:websiteValue,mode:payload.mode,sourcePath:location.pathname,notices:noticeNodes().map(el=>normalize(el.innerText)),baseline:commentNodes().map(node=>node.id).filter(Boolean)}};
   }
   function submitOnce(payload) {
     try {
@@ -152,7 +152,17 @@
     const matched=commentNodes().find(node=>visible(node)&&normalize(node.innerText).includes(probe.body)&&(!node.id||!probe.baseline.includes(node.id)));
     if(matched){
       if(matched.querySelector('.comment-awaiting-moderation')||/awaiting moderation|pending approval|aguardando modera|等待审核/i.test(matched.innerText))return {state:'pending_review',evidence:'对应评论显示等待审核，尚未公开。'};
-      if(location.pathname===probe.sourcePath&&!new URLSearchParams(location.search).has('unapproved'))return {state:'published',evidence:'页面评论区已出现与提交内容一致的新评论（当前浏览器可见）。'};
+      if(location.pathname===probe.sourcePath&&!new URLSearchParams(location.search).has('unapproved')){
+        const links=[...matched.querySelectorAll('a[href]')].flatMap(a=>{
+          try{
+            const expected=new URL(probe.website),actual=new URL(a.href);expected.hash='';actual.hash='';
+            if(!/^https?:$/.test(actual.protocol)||actual.href!==expected.href)return [];
+            return [{url:actual.href,rel:a.rel.toLowerCase().split(/\s+/).filter(Boolean)}];
+          }catch{return [];}
+        }).slice(0,10);
+        return {state:'published',linkCheck:{found:links.length>0,links,visibility:'current_browser'},
+          evidence:'对应评论在当前浏览器可见；公开性未单独核验。'+(links.length?'已找到目标链接，记录 rel 属性。':'未发现目标链接，不能认定外链成功。')};
+      }
     }
     const notices=noticeNodes().map(el=>normalize(el.innerText)).filter(t=>!(probe.notices||[]).includes(t));
     if(probe.mode==='directory'&&notices.some(t=>/(your (listing|site|submission)|您.*(网站|提交)).*(received|submitted|review|收到|审核)/i.test(t)))return {state:'pending_review',evidence:'网站明确确认收到目录提交；尚未确认公开发布。'};

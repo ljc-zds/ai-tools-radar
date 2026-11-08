@@ -81,7 +81,7 @@
     permission=activeTab?Promise.resolve(true):chrome.permissions.request({origins:[pattern(url)]});
    }catch{status('无法请求目标网站权限；请重新打开插件后重试。');return;}
    working=true;callbacks.busy(true);status('正在请求此目标网站的访问权限……');
-   Promise.resolve(permission).then(async granted=>{
+   return Promise.resolve(permission).then(async granted=>{
     if(id!==generation)return;
     if(!granted){status('未授权此网站，未打开或填写任何目标。请再次点击并允许访问。');working=false;callbacks.busy(false);return;}
     paused=null;callbacks.paused(null);const runController=new AbortController();controller=runController;
@@ -94,6 +94,10 @@
   }
   return{
    open:url=>launch(url),
+   openAuthorized:async url=>{
+    if(!await chrome.permissions.contains({origins:[pattern(url)]}))throw Error('尚未授权目标网页。');
+    return launch(url,null,false,null,true);
+   },
    current:()=>{
     if(working){status('自动填写正在进行；可点击取消。');return;}
     if(!callbacks.ready())return;

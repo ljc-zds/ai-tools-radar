@@ -1,0 +1,159 @@
+const scanKey='blogScanJobs', recursionKey='blogRecursionTasks';
+let scanJobs=[], scanStopped=false, scanner=null;
+const scanLive=new Map();
+const guestLabel=v=>({likely_guest:'可发布（疑似免登录）',login_required:'需要登录',unknown:'无法确认'}[v]||'未分析');
+const nap=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function scanProgressLabel(url){
+  const index=scanJobs.findIndex(job=>job.url===url);
+  const done=scanJobs.filter(job=>job.state==='done').length;
+  const failed=scanJobs.filter(job=>job.state==='failed').length;
+  return `${index>=0?`正在分析第 ${index+1} / ${scanJobs.length} 个 · `:''}已完成 ${done}，失败 ${failed}`;
+}
+function renderScanProgress(){
+  const done=scanJobs.filter(j=>j.state==='done').length,failed=scanJobs.filter(j=>j.state==='failed').length;
+  const running=scanJobs.filter(j=>j.state==='running');
+  const excluded=scanJobs.filter(j=>j.state==='done'&&(j.excluded||URLTools.searchResultReason(j.url))).length;
+  const lines=[`已处理 ${done} / ${scanJobs.length} · 其中排除 ${excluded} · 失败 ${failed} · 同时分析 ${running.length} 个`];
+  if(scanStopped)lines.push('正在停止；已开始的请求结束后保存结果。');
+  for(const job of running){
+    const live=scanLive.get(job.url),index=scanJobs.indexOf(job)+1;
+    lines.push(`第 ${index} / ${scanJobs.length} 个 · ${live?.stage||'准备分析'} · ${live?Math.floor((Date.now()-live.started)/1000):0} 秒\n${job.url}`);
+  }
+  $('scanStatus').textContent=lines.join('\n');
+}
+function updateScanStatus(jobs){
+  scanJobs=jobs;renderScanProgress();
+  if(typeof ahrefsGroups!=='undefined')renderAhrefs();
+}
+function scanEntries(rows,remaining){
+  return rows.flatMap(row=>{try{return [{url:URLTools.canonicalURL(row.url),remaining}];}catch{return [];}});
+}
+async function visitBlog(url,isStopped){
+  const excludedResult=(reason,finalUrl=url)=>({verdict:'unknown',excluded:true,reason,finalUrl,hasCommentForm:false,captcha:false,sites:[],linkMethods:[],linkSamples:[]});
+  const initialReason=URLTools.searchResultReason(url);
+  if(initialReason)return excludedResult(initialReason);
+  let stage='正在加载网页';
+  const started=Date.now();
+  const progress=()=>{scanLive.set(url,{stage,started});renderScanProgress();};
+  const timer=setInterval(progress,1000);progress();
+  let tab;
+  try{
+    tab=await chrome.tabs.create({url,active:false});
+    let ready=false;
+    for(let i=0;i<80;i++){
+      if(isStopped())throw Error('已停止');
+      const current=await chrome.tabs.get(tab.id);
+      const redirectReason=URLTools.searchResultReason(current.url);
+      if(redirectReason)return excludedResult('来源页跳转到了'+redirectReason,current.url);
+      if(current.status==='complete'){ready=true;break;}
+      await nap(250);
+    }
+    if(!ready)throw Error('网页加载超时');
+    await nap(1500);
+    if(isStopped())throw Error('已停止');
+    stage='正在读取评论与表单';progress();
+    const [{result:initialPage}]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:readBlogEvidence,args:[true]});
+    if(!initialPage?.evidence)throw Error('无法读取页面证据');
+    const finalReason=URLTools.searchResultReason(initialPage.url);
+    if(finalReason)return excludedResult('来源页跳转到了'+finalReason,initialPage.url);
+    const page=await collectCommentPages(tab.id,initialPage,isStopped,value=>{stage=value;progress();});
+    const comments=`保存 ${page.items.length} 条评论；${page.commentCollection?.reason||''}`;
+    if(isStopped())throw Error('已停止');
+    let result;
+    stage='正在等待 Codex CLI 判断（单次最多 100 秒）';progress();
+    try{result=await discoveryRequest('draft',{mode:'assess_blog',evidence:page.evidence});}
+    catch(error){error.bridgeFailure=true;throw error;}
+    let verdict=['likely_guest','login_required','unknown'].includes(result.verdict)?result.verdict:'unknown';
+    if(verdict==='likely_guest'&&(!page.evidence.forms.some(f=>f.comment&&f.website&&f.submit&&!f.captcha)||page.evidence.notices.length))verdict='unknown';
+    const origin=new URL(page.url).hostname.replace(/^www\./,'');
+    const sites=[...new Set(page.items.flatMap(item=>item.sites).flatMap(raw=>{
+      try{const value=URLTools.canonicalURL(raw);return URLTools.searchResultReason(value)||new URL(value).hostname.replace(/^www\./,'')===origin?[]:[value];}catch{return [];}
+    }))];
+    return {verdict,excluded:false,reason:String(result.reason||'').slice(0,300),captcha:page.evidence.forms.some(f=>f.captcha),
+      hasCommentForm:page.evidence.forms.length>0,linkMethods:page.evidence.linkMethods||[],linkSamples:page.items.flatMap(item=>item.links||[]).slice(0,50),commentCollection:page.commentCollection,embeddedComments:page.evidence.embeddedComments,sites,comments,finalUrl:URLTools.canonicalURL(page.url)};
+  }finally{clearInterval(timer);scanLive.delete(url);if(tab)await chrome.tabs.remove(tab.id).catch(()=>{});}
+}
+async function afterCollection(rows){
+  const rounds=Number($('recursionRounds').value);
+  if(!Number.isInteger(rounds)||rounds<0||rounds>5)throw Error('递归轮数须为 0–5；本次外链已保存。');
+  await scanner.enqueue(scanEntries(rows,rounds));
+  await runDiscovery();
+}
+async function runDiscovery(){
+  return navigator.locks.request('blogDiscoveryWorkflow',{ifAvailable:true},async lock=>{
+    if(!lock){$('scanStatus').textContent='另一个侧边栏正在分析，请在原窗口查看进度。';return;}
+    scanStopped=false;$('stopDiscovery').hidden=false;
+    try{
+      if(!localStorage.getItem('codexBridgeToken'))throw Error('外链已保存并排队；请先启用 Codex CLI 桥接，再点继续分析。');
+      // Check the adapter without spending a model request before the first article.
+      $('scanStatus').textContent='正在检查本机桥接连接（不调用模型）……';
+      const concurrency=Number($('scanConcurrency').value);
+      if(!Number.isInteger(concurrency)||concurrency<1||concurrency>5)throw Error('并发数量须为 1–5。');
+      const health=await discoveryRequest('health',{});
+      if(concurrency>(health.capacity||1))throw Error('当前桥接仅支持 '+(health.capacity||1)+' 个并发；请重启新版桥接，或将并发数设为 1。');
+      if(health.busy)throw Error('桥接仍在处理上一条请求，请等待终端结束后继续。');
+      let retryFailed=true;
+      while(!scanStopped){
+        const result=await scanner.run({retryFailed,concurrency});retryFailed=false;
+        if(result.stopped){scanStopped=true;break;}
+        const tasks=(await chrome.storage.local.get(recursionKey))[recursionKey]||[];
+        for(const job of result.jobs){
+          if(job.state!=='done'||!job.remaining)continue;
+          for(const site of job.sites||[]){
+            if(URLTools.searchResultReason(site))continue;
+            const domain=new URL(site).hostname.replace(/^www\./,'');
+            let task=tasks.find(t=>t.domain===domain);
+            if(!task){task={domain,remaining:job.remaining-1,state:'pending'};tasks.push(task);}
+            else task.remaining=Math.max(task.remaining,job.remaining-1);
+          }
+        }
+        await chrome.storage.local.set({[recursionKey]:tasks});
+        const task=tasks.find(t=>!URLTools.searchResultReason('https://'+t.domain+'/')&&(t.state!=='done'||(t.propagated??-1)<t.remaining));
+        if(!task)break;
+        if(scanStopped)break;
+        $('scanStatus').textContent=`递归查询 ${task.domain}（后续还可扩展 ${task.remaining} 轮）……`;
+        try{
+          if(!task.rows){
+            const report=await collectSemrush(task.domain,true);
+            await saveCollected(report.target,report.rows);
+            task.rows=report.rows;task.state='done';
+            await chrome.storage.local.set({[recursionKey]:tasks});
+          }
+          if(scanStopped)break;
+          await scanner.enqueue(scanEntries(task.rows,task.remaining));
+          task.propagated=task.remaining;task.state='done';delete task.error;
+          await chrome.storage.local.set({[recursionKey]:tasks});
+        }catch(error){task.error=error.message;await chrome.storage.local.set({[recursionKey]:tasks});throw Error('递归已暂停：'+error.message);}
+      }
+      updateScanStatus(scanJobs);
+      const lastError=[...scanJobs].reverse().find(job=>job.state==='failed')?.error;
+      $('scanStatus').textContent+=scanStopped?' 已暂停。'+(lastError||'可点击继续分析。'):' 本轮分析与递归完成。';
+    }catch(error){$('scanStatus').textContent=error.message;}
+    finally{$('stopDiscovery').hidden=true;}
+  });
+}
+function initDiscovery(){
+  scanner=BlogQueue.create({
+    load:async()=>(await chrome.storage.local.get(scanKey))[scanKey]||[],
+    save:jobs=>chrome.storage.local.set({[scanKey]:jobs}),visit:visitBlog,changed:updateScanStatus,
+    lock:fn=>navigator.locks.request(scanKey,fn)
+  });
+  $('scanConcurrency').value=localStorage.getItem('scanConcurrency')||'3';
+  $('scanConcurrency').onchange=()=>localStorage.setItem('scanConcurrency',$('scanConcurrency').value);
+  $('recursionRounds').value=localStorage.getItem('recursionRounds')||'0';
+  $('recursionRounds').onchange=()=>localStorage.setItem('recursionRounds',$('recursionRounds').value);
+  $('stopDiscovery').onclick=()=>{scanStopped=true;scanner.stop();$('scanStatus').textContent='正在停止；当前已发出的模型请求结束后暂停。';};
+  $('resumeDiscovery').onclick=()=>{
+    if(busy)return;
+    const permission=chrome.permissions.request({origins:['https://*/*','http://*/*']});
+    run(async()=>{if(!await permission)throw Error('需要网页读取权限。');await runDiscovery();});
+  };
+  $('analyzeLibrary').onclick=()=>{
+    if(busy)return;
+    const permission=chrome.permissions.request({origins:['https://*/*','http://*/*']});
+    run(async()=>{if(!await permission)throw Error('需要网页读取权限。');
+      const rounds=Number($('recursionRounds').value);
+      if(!Number.isInteger(rounds)||rounds<0||rounds>5)throw Error('递归轮数须为 0–5。');
+      await scanner.enqueue(scanEntries([...ahrefsGroups.values()].flat(),rounds),{refresh:$('refreshEvidence').checked});await runDiscovery();});
+  };
+}

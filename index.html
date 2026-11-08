@@ -325,7 +325,7 @@ function render() {
 function renderLib(t) {
   // 【08-16 用户定】外链库的核心交互:查竞品的 dofollow 来源,照着投
   const head = `<div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:12px">
-    <b>${t.lib_h}</b><div class="dim" style="font-size:12px;margin:2px 0 8px">${t.lib_sub}</div>
+    <b>${t.lib_h}</b> · <a href="backlinks.html">${t.v_lib === '外链库' ? '收集与导出外链' : 'Collect and export backlinks'}</a><div class="dim" style="font-size:12px;margin:2px 0 8px">${t.lib_sub}</div>
     <input type="search" id="compq" list="links_idx" placeholder="${t.lib_ph}" value="${esc(libDom)}"
       style="padding:8px 12px;border:1px solid var(--acc);border-radius:8px;font-size:13px;width:320px">
     <datalist id="links_idx">${LINKS_IDX.map(d => `<option value="${d}">`).join('')}</datalist>

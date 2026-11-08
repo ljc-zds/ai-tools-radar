@@ -6,6 +6,11 @@ const submissionLocked = state => ['submitted','outcome_unknown','pending_review
 const stateLabels = {outcome_unknown:'结果未知 · 已锁定防重',pending_review:'等待审核',published:'已发现对应评论',submit_failed:'提交失败 · 请人工检查',submit_paused:'提交已暂停 · 请人工检查',candidate: '待处理', filled: '已填写（未提交）', submitted: '用户确认已提交', skipped: '已跳过', review_needed: '需人工复核'};
 const say = text => { $('status').textContent = text; $('settingsStatus').textContent=text; };
 function controls() {
+  $('captureSemrush').disabled=busy;
+  $('captureAhrefs').disabled=busy;
+  for(const id of ['analyzeLibrary','publishLibrary','publishDomain','publisherName','publisherEmail','publishLimit','publishAction','refreshEvidence'])$(id).disabled=busy;
+  $('resumeDiscovery').disabled=busy; $('recursionRounds').disabled=busy; $('scanConcurrency').disabled=busy; $('reportPageLimit').disabled=busy; $('commentPageLimit').disabled=busy;
+  for(const button of $('ahrefsGroups').querySelectorAll('button'))button.disabled=busy;
   $('events').disabled=busy;$('autoSubmit').disabled=busy;
   $('fillCurrent').disabled = busy;
   $('save').disabled = busy; $('form').disabled = busy; $('mode').disabled = busy; $('product').disabled = busy;
@@ -17,7 +22,7 @@ function controls() {
   $('resourceFile').disabled=busy; $('linkFile').disabled=busy; $('refreshFile').disabled=busy||!linkedHandle;
   $('cancelAuto').hidden=!autoActive&&!autoPaused; $('resumeAuto').disabled=busy;
   for(const button of $('resourceList').querySelectorAll('button'))button.disabled=busy;
-  $('testConnection').disabled = busy; $('profileFile').disabled = busy; $('applyProfile').disabled = busy || !pendingProfile;
+  $('saveCodex').disabled=busy; $('disableCodex').disabled=busy; $('testConnection').disabled = busy; $('profileFile').disabled = busy; $('applyProfile').disabled = busy || !pendingProfile;
 }
 function resetTarget() { target = null; context = null; $('confirmed').checked = false; clearDraft(); displayTarget(); }
 function displayTarget() {
@@ -49,7 +54,7 @@ async function loadResources(allowClamp = true) {
     const source = document.createElement('small');
     source.textContent = `${item.type === 'historical_blog' ? '历史博客记录（非本次验证）' : '未验证候选（非已确认目录或表单）'} · ${item.observedAt || '日期未知'} · ${item.status}${item.statusConflict ? '（同日记录冲突）' : ''} · ${stateLabels[item.workflow.state]}`;
     const files = document.createElement('small'); files.textContent = '来源：' + item.sources.slice(0,3).map(s => s.file).join('、') + (item.sources.length>3?` 等 ${item.sources.length} 个快照`:'');
-    const open = document.createElement('button'); open.textContent = '打开并自动填写'; open.onclick=()=>automation.open(item.url);
+    const open = document.createElement('button'); open.textContent = '打开并自动填写'; open.onclick=()=>{showPane('publishPane');automation.open(item.url);};
     open.textContent='打开填写并提交';open.className='resource-action';
     title.className='resource-title'; title.title=item.title; source.textContent=stateLabels[item.workflow.state]+' · '+(item.type==='historical_blog'?'历史记录':'未验证候选');
     box.append(title, url, source, open); $('resourceList').append(box);
@@ -59,11 +64,246 @@ async function loadResources(allowClamp = true) {
 
 async function run(fn) { if (busy) return; busy = true; controls(); try { await fn(); } catch (error) { say(error.message || '操作失败，请重新分析。'); } finally { busy = false; controls(); } }
 async function refreshResourceList() {
-  try { await loadResources(); }
+  try { await loadResources(); await refreshLibraryRecords(); }
   catch { say($('status').textContent + '\n外链列表更新失败，请重新搜索。'); }
 }
 async function api(path, body, options) { return LocalAPI.api(path, body, options); }
 function openOnly(url){if(busy){say('请先取消当前任务，再打开其他目标。');return;}run(async()=>{resetTarget();say('正在打开目标，仅打开模式不会填写……');await chrome.tabs.create({url,active:true});say('目标已打开。仅打开模式不会填写；如需自动填写，请使用资源卡的主按钮。');});}
+const ahrefsGroups = new Map();
+const ahrefsStorageKey = 'ahrefsBacklinkGroups';
+function showPane(id) {
+  for (const button of $('workflowTabs').querySelectorAll('button[data-pane]')) {
+    const selected = button.dataset.pane === id;
+    $(button.dataset.pane).hidden = !selected;
+    button.setAttribute('aria-pressed', String(selected));
+  }
+}
+$('workflowTabs').onclick = event => {
+  const button = event.target.closest('button[data-pane]');
+  if (button) showPane(button.dataset.pane);
+};
+async function loadAhrefsGroups() {
+  const stored = (await chrome.storage.local.get(ahrefsStorageKey))[ahrefsStorageKey] || [];
+  ahrefsGroups.clear();
+  for (const {target, links} of stored) ahrefsGroups.set(target, links);
+}
+function renderAhrefs(){renderCollectedCards();}
+$('spamFilter').value = localStorage.getItem('backlinkSpamFilter') || 'all';
+if (!$('spamFilter').value) $('spamFilter').value = 'all';
+$('spamFilter').onchange = () => {
+  localStorage.setItem('backlinkSpamFilter',$('spamFilter').value);
+  renderAhrefs();controls();
+};
+$('captureAhrefs').onclick = () => {
+  if (busy) return;
+  const status = $('ahrefsStatus');
+  status.textContent = '正在读取 Ahrefs 结果……';
+  const permission = chrome.permissions.request({origins:['https://*/*','http://*/*']});
+  return run(async () => {
+    try {
+      if (!await permission) throw Error('未授权读取 Ahrefs 页面，请重试并允许。');
+      await captureAhrefs();
+    } catch(error) {
+      status.textContent = error.message || '无法获取 Ahrefs 外链。';
+    }
+  });
+};
+async function captureAhrefs() {
+  const [tab] = await chrome.tabs.query({active:true,currentWindow:true});
+  if (!tab?.id) throw Error('找不到当前标签页。');
+  const detected=websiteContext(tab.url);
+  if(detected?.service!=='ahrefs'||!detected.report){
+    const raw=$('ahrefsTarget').value.trim()||detected?.domain;
+    if(!raw)throw Error('请打开要查询的网站，或填写目标域名。');
+    const domain=semrushStart(raw).target;
+    const report=new URL('https://ahrefs.com/backlink-checker/');
+    report.searchParams.set('input','https://'+domain+'/');report.searchParams.set('mode','subdomains');
+    await chrome.tabs.create({url:report.href,active:true});
+    $('ahrefsStatus').textContent='已打开 '+domain+' 的 Ahrefs 查询。完成网页验证、显示结果后，再点获取。';
+    return;
+  }
+  let result;
+  try {
+    [{result}] = await chrome.scripting.executeScript({target:{tabId:tab.id},func:readAhrefsResults});
+  } catch {throw Error('请在 Ahrefs 免费反链检查器标签页点击扩展图标，再点「获取 Ahrefs 外链」。');}
+  if (!result || result.error) throw Error(result?.error || '没有读取到 Ahrefs 结果。');
+  if (!result.rows.length) throw Error('未识别到可见的来源页列表。请先完成验证并打开反链明细。');
+  const raw = result.target || $('ahrefsTarget').value.trim();
+  if (!raw) throw Error('查询地址没有目标网站，请填写「查询的目标网站」后再点获取。');
+  const {website,added,total} = await saveCollected(raw,result.rows);
+  await afterCollection(result.rows);
+  $('ahrefsTarget').value = website;
+  $('ahrefsStatus').textContent = '本次读取 ' + result.rows.length + ' 条，新增 ' + added + ' 条；该网站已在本机保存 ' + total + ' 条。';
+}
+async function saveCollected(raw, rows) {
+  const website = URLTools.canonicalURL(/^https?:\/\//i.test(raw) ? raw : 'https://' + raw);
+  return navigator.locks.request(ahrefsStorageKey, async () => {
+    await loadAhrefsGroups();
+    const links = new Map((ahrefsGroups.get(website)||[]).map(item=>[item.url,item]));
+    let added = 0;
+    for (const item of rows) {
+      let url;try { url=URLTools.canonicalURL(item.url); }catch {continue;}
+      if (url===website) continue;
+      const previous = links.get(url);
+      links.set(url,{...previous,url,title:item.title || previous?.title || '',
+        ...(item.riskEvidence ? {riskEvidence:item.riskEvidence} : {})});
+      if (!previous) added++;
+    }
+    if(!links.size)throw Error('结果里没有可保存的来源网址。');
+    const next = new Map(ahrefsGroups).set(website,[...links.values()]);
+    try {
+      await chrome.storage.local.set({[ahrefsStorageKey]:[...next].map(([target,links])=>({target,links}))});
+    } catch { throw Error('本次外链未保存：浏览器扩展存储不可用或已满。'); }
+    ahrefsGroups.set(website,next.get(website));
+    renderAhrefs(website);
+    return {website,added,total:links.size};
+  });
+}
+async function discoveryRequest(path, data, pairingToken = null) {
+  const token = pairingToken || localStorage.getItem('codexBridgeToken');
+  if (!token) throw Error('请先在设置中启用 Codex CLI 本机桥接。');
+  let response;
+  try {
+    response = await fetch('http://127.0.0.1:8795/'+path,{method:'POST',
+      headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
+      body:JSON.stringify(data),credentials:'omit',redirect:'error',signal:AbortSignal.timeout(path==='health'?5000:110000)});
+  } catch(error) {throw Error(error.name==='TimeoutError'?'等待本机桥接响应超时；外链已保存，请检查桥接终端后继续。':'无法连接本机桥接。请启动新版桥接并核对配对码。');}
+  if(path==='health' && [400,404].includes(response.status))throw Error('桥接版本过旧，请关闭旧桥接终端并启动新版，再重新保存配对码。');
+  const result = await response.json().catch(()=>null);
+  if (!response.ok || result?.error) throw Error(result?.error || ({
+    403:'配对失败，请重新保存桥接配对码。',404:'请重启为新版桥接。',429:'桥接正在处理另一项任务。',504:'Codex CLI 在 100 秒内没有返回结果。外链已保存；请检查 CLI 网络或模型可用性后继续，此步骤不需要 CDP。'
+  }[response.status] || '桥接未返回可用结果，请检查本机终端。'));
+  return result;
+}
+function discovery(action) {
+  return run(async()=>{
+    const status=$('discoveryStatus');
+    status.textContent='正在处理……';
+    try{status.textContent=await action();}
+    catch(error){status.textContent=error.message;}
+  });
+}
+function semrushStart(input) {
+  if (!input) return null;
+  const url = new URL('https://sem.3ue.co/analytics/backlinks/pages/');
+  let target = input;
+  if (/^https?:\/\//i.test(input)) {
+    const supplied = new URL(input);
+    if (supplied.origin === url.origin && /^\/analytics\/backlinks\/(pages|backlinks)\/?$/i.test(supplied.pathname)) {
+      target = supplied.searchParams.get('q') || '';
+      const session = supplied.searchParams.get('__gmitm');
+      if(session)url.searchParams.set('__gmitm',session);
+    } else target = new URL(URLTools.canonicalURL(input)).hostname;
+  }
+  if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(target))
+    throw Error('请输入有效域名，例如 pixverse.ai，或完整 Semrush 镜像报告链接。');
+  url.searchParams.set('q',target.toLowerCase());
+  url.searchParams.set('searchType','domain');
+  return {url:url.href,target:target.toLowerCase()};
+}
+$('captureSemrush').onclick=()=>{
+  if(busy)return;
+  const input=$('semrushTarget').value.trim();
+  const permission=chrome.permissions.request({origins:['https://*/*','http://*/*']});
+  return discovery(async()=>{
+    if(!await permission)throw Error('需要允许读取 Semrush 镜像，才能自动打开并采集。');
+    const {context}=await activeWebsiteContext();
+    const requested=input?semrushStart(input).target:context?.domain;
+    if(!requested&&!context?.report)throw Error('请打开要查询的网站，或填写目标域名。');
+    const useCurrent=context?.service==='semrush'&&context.report&&(!requested||requested===context.domain);
+    const report=await collectSemrush(useCurrent?'':input||requested);
+    const saved=report.capture||await saveCollected(report.target,report.rows);
+    if(!collectionStopped)await afterCollection(report.rows);
+    return `读取 ${report.rows.length} 条，新增 ${saved.added} 条。已按目标保存。${report.capture?.reason||''}`;
+  });
+};
+async function collectSemrush(input,recursive=false){
+    if(!recursive){collectionStopped=false;$('stopReport').hidden=false;}
+    const start=semrushStart(input);
+    const tab=start?await chrome.tabs.create({url:start.url,active:!recursive}):
+      (await chrome.tabs.query({active:true,currentWindow:true}))[0];
+    if(!tab?.id)throw Error('找不到报告标签页。');
+    try {
+    let switched=false;
+    for(let attempt=0;attempt<45;attempt++){
+      if(recursive?scanStopped:collectionStopped)throw Error('已停止采集');
+      const current=await chrome.tabs.get(tab.id);
+      let report;
+      if(current.status==='complete'){
+        try {
+          [{result:report}]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:readSemrushReport});
+        } catch {
+          if(!start)throw Error('请在 Semrush 明细标签页点击扩展图标后采集，或先输入目标域名。');
+        }
+      }
+      if(report?.error)throw Error(report.error);
+      if(report?.detail&&!switched){
+        switched=true;
+        await chrome.tabs.update(tab.id,{url:report.detail});
+        $('discoveryStatus').textContent='已切换到反链来源明细，正在等待表格……';
+      } else if(report?.rows?.length){
+        if(!report.target || (start && report.target.toLowerCase()!==start.target))
+          throw Error('报告目标与查询不一致，未保存。');
+        return await collectReportPages(tab.id,report,recursive);
+      }
+      await new Promise(resolve=>setTimeout(resolve,650));
+    }
+    throw Error('等待反链明细超时。请检查打开的报告是否已登录且有数据；也可清空输入框后采集当前明细页。');
+    } finally { if(!recursive)$('stopReport').hidden=true; if(recursive && start)await chrome.tabs.remove(tab.id).catch(()=>{}); }
+}
+const blogKey='discoveredBlogComments';
+async function renderBlogEvidence(){
+  const stored=(await chrome.storage.local.get(blogKey))[blogKey]||[];
+  const panel=$('blogEvidence');panel.replaceChildren();
+  for(const group of stored){
+    const box=document.createElement('details'), title=document.createElement('summary');
+    title.textContent=group.url+' · '+group.items.length+' 条已保存评论';
+    box.append(title);
+    for(const entry of group.items){
+      const p=document.createElement('p');p.textContent=entry.text;box.append(p);
+    }
+    panel.append(box);
+  }
+}
+async function saveBlogComments(page){
+  if(!page.items.length)return '未识别到已加载的评论。';
+  const url=URLTools.canonicalURL(page.url);
+  const source=new URL(url);
+  // WordPress comment pagination refers to the same article.
+  source.pathname=source.pathname.replace(/\/comment-page-\d+\/?$/i,'/');
+  source.searchParams.delete('cpage');
+  const article=URLTools.canonicalURL(source.href);
+  const sites=new Map();
+  const items=page.items.map(item=>({
+    text:item.text,links:(item.links||[]).slice(0,20),sites:item.sites.flatMap(raw=>{
+      try{
+        const href=URLTools.canonicalURL(raw);
+        if(URLTools.searchResultReason(href))return [];
+        if(new URL(href).hostname.replace(/^www\./,'')===source.hostname.replace(/^www\./,''))return [];
+        sites.set(href,{url:href,title:'评论者公开网址（待验证）'});return [href];
+      }catch{return [];}
+    })
+  }));
+  await navigator.locks.request(blogKey,async()=>{
+    const stored=(await chrome.storage.local.get(blogKey))[blogKey]||[];
+    const groups=new Map(stored.map(group=>[group.url,group.items]));
+    const merged=new Map((groups.get(article)||[]).map(item=>[JSON.stringify([item.text,item.sites]),item]));
+    for(const item of items)merged.set(JSON.stringify([item.text,item.sites]),item);
+    groups.set(article,[...merged.values()]);
+    await chrome.storage.local.set({[blogKey]:[...groups].map(([url,items])=>({url,items}))});
+  });
+  if(sites.size)await saveCollected(article,[...sites.values()]);
+  await renderBlogEvidence();
+  return `已读取 ${items.length} 条评论、${sites.size} 个评论者网址，已保存到资源库。`+
+    (page.more?' 有评论分页；请翻页后再次收集。':' 仅包含网页当前已加载的评论。');
+}
+$('exportAhrefs').onclick = () => {
+  const groups = [...ahrefsGroups].map(([target,links])=>({target,links:links.filter(item=>matchesCollected(item)).map(item=>({...item,blogAssessment:scanJobs.find(j=>j.url===item.url)}))})).filter(group=>group.links.length);
+  const items = groups.flatMap(group=>group.links.map(row=>({...row,target:group.target,title:group.target+' ← '+(row.title||row.url)})));
+  const url = URL.createObjectURL(new Blob([JSON.stringify({groups,items},null,2)],{type:'application/json'}));
+  const link=document.createElement('a');link.href=url;link.download='ahrefs-backlinks.json';link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
 async function refreshSourceInfo(){
   const source=await LocalAPI.resourceSource();linkedHandle=await LocalAPI.resourceHandle();
   $('sourceInfo').title=source?`${source.name} · 拒绝 ${source.metadata.rejectedRows} 条 · ${new Date(source.importedAt).toLocaleString()}`:'';
@@ -85,12 +325,14 @@ async function products() {
   if (data.products.some(p=>p.id===previous)) $('product').value = previous;
   resetTarget(); resourcePage = 1;
   say('产品已加载，正在读取本地外链文件……');
-  await refreshSourceInfo();await loadResources();
-  if(!modelReady)onboarding('尚未配置模型 API Key，点右上角设置。可先浏览外链。');
+  await refreshSourceInfo();await loadResources();await refreshLibraryRecords();
+  if(!modelReady)onboarding('请在设置中启用 Codex CLI 或配置模型 API Key。可先浏览外链。');
   else say('已就绪，选择当前网页或一条外链开始填写。');
 }
 async function displayConfig() {
-  const cfg = await LocalAPI.configView();modelReady=cfg.hasKey;
+  const cfg = await LocalAPI.configView();modelReady=cfg.hasKey||!!localStorage.getItem('codexBridgeToken');
+  $('codexToken').value='';
+  $('codexState').textContent=localStorage.getItem('codexBridgeToken')?'已启用 Codex CLI；用「测试连接」检查。':'当前使用 API Key 模式。';
   $('baseUrl').value = cfg.base_url; $('model').value = cfg.model; $('wire').value = cfg.wire_api; $('effort').value = cfg.reasoning_effort;
   $('apiKey').value = ''; $('keyState').textContent = cfg.hasKey ? '已保存（不回显）' : '尚未保存';
 }
@@ -114,6 +356,18 @@ $('save').onclick = () => {
   catch (error) { say(error.message); return; }
   permission.then(granted => run(async () => { if (!granted) throw Error('未授权模型服务域名，配置未保存。'); await LocalAPI.saveConfig(raw); await displayConfig(); say('模型设置已保存在本机扩展数据库。可点击测试连接；测试会调用模型。'); })).catch(()=>say('模型域名授权失败，配置未保存。'));
 };
+$('saveCodex').onclick=()=>{
+  const token=$('codexToken').value.trim();
+  if(!/^[A-Za-z0-9_-]{43}$/.test(token)){say('请输入桥接终端显示的完整配对码。');return;}
+  chrome.permissions.request({origins:['http://127.0.0.1/*']}).then(granted=>run(async()=>{
+    if(!granted)throw Error('需要授权访问本机桥接。');
+    say('正在核验配对码……');
+    const health=await discoveryRequest('health',{},token);
+    if(health.ok!==true)throw Error('桥接未返回有效的配对确认，未保存新配对码。');
+    localStorage.setItem('codexBridgeToken',token);await displayConfig();say('配对已验证，Codex CLI 已启用。可测试模型连接或继续分析。');
+  })).catch(()=>say('本机桥接授权失败。'));
+};
+$('disableCodex').onclick=()=>run(async()=>{localStorage.removeItem('codexBridgeToken');await displayConfig();say('已切回 API Key 模式。');});
 $('testConnection').onclick = () => run(async () => { say('正在直接测试已保存的模型服务……'); await LocalAPI.testConnection(); say('模型连接成功，JSON 输出正常。'); });
 $('profileFile').onchange = () => run(async () => {
   pendingProfile = null; $('importSummary').textContent = '';
@@ -250,7 +504,7 @@ $('undo').onclick = () => run(async () => {
   await refreshResourceList();
 });
 for (const id of ['form', 'mode']) $(id).onchange = () => { $('confirmed').checked = false; clearDraft(); };
-$('product').onchange = () => run(async () => { resetTarget(); resourcePage = 1; await loadResources(); say('产品已切换，可填写当前页或选择外链。'); });
+$('product').onchange = () => run(async () => { resetTarget(); resourcePage = 1; await loadResources(); await refreshLibraryRecords(); say('产品已切换，可填写当前页或选择外链。'); });
 $('confirmed').onchange = controls;
 $('markSubmitted').onclick = () => run(async () => {
   if (!target || !$('confirmed').checked || target.productId !== $('product').value) throw Error('请核对目标与产品，并勾选手动提交确认。');
@@ -293,7 +547,7 @@ function supportedGroups(){
 }
 const automation=AutoFill.create({
  status:say,ready:autoReady,selection:()=>({productId:$('product').value,mode:$('mode').value}),canonicalURL:LocalAPI.canonicalURL,
- reset:resetTarget,busy:value=>{autoActive=value;busy=value;controls();},
+ reset:resetTarget,busy:value=>{autoActive=value;busy=value||batchActive;controls();},
  paused:value=>{autoPaused=value;$('resumeAuto').hidden=!value;$('resumeAuto').textContent=value?.kind==='redirect'?'授权跳转地址并继续':'选择表单后继续';controls();},
  analyze:analyzePage,generate:generateDraft,fill:fillDraft,submit:submitDraft,
  choose:explicit=>{
@@ -308,10 +562,21 @@ const automation=AutoFill.create({
 $('autoSubmit').checked=localStorage.getItem('autoSubmit')!=='false';
 $('autoSubmit').onchange=()=>localStorage.setItem('autoSubmit',String($('autoSubmit').checked));
 $('fillCurrent').onclick=()=>automation.current();
-$('resumeAuto').onclick=()=>automation.resume();$('cancelAuto').onclick=()=>automation.cancel();
+$('resumeAuto').onclick=()=>automation.resume();$('cancelAuto').onclick=()=>{batchStopped=true;automation.cancel();};
+initDiscovery();initLibrary();initPublish();initTargetContext();
+$('stopReport').onclick=()=>{collectionStopped=true;};
+for(const id of ['reportPageLimit','commentPageLimit']){
+ $(id).value=localStorage.getItem(id)||'3';
+ $(id).onchange=()=>localStorage.setItem(id,$(id).value);
+}
 (async()=>{
  say('正在初始化本机资料和默认产品……');
+ try{scanJobs=(await chrome.storage.local.get(scanKey))[scanKey]||[];updateScanStatus(scanJobs);await loadAhrefsGroups();renderAhrefs();}
+ catch{$('ahrefsStatus').textContent='无法读取本机保存的 Ahrefs 外链。';}
+ try{await renderBlogEvidence();}
+ catch{$('discoveryStatus').textContent='无法读取本机保存的博客评论。';}
  try{await LocalAPI.init();await displayConfig();await history();await run(products);}
  catch(error){say(error.message||'本机初始化失败；请关闭旧插件页并刷新扩展，或导入产品资料。');}
  controls();
+ await refreshCurrentWebsite();
 })();
