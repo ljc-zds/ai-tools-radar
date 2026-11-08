@@ -1,7 +1,7 @@
 const scanKey='blogScanJobs', recursionKey='blogRecursionTasks';
 let scanJobs=[], scanStopped=false, scanner=null;
 const scanLive=new Map();
-const guestLabel=v=>({likely_guest:'可发布（疑似免登录）',login_required:'需要登录',unknown:'无法确认'}[v]||'未分析');
+const guestLabel=v=>({likely_guest:'可发布（疑似免登录）',login_required:'需要登录',link_unverified:'可留言，留链待验证',unknown:'无法确认'}[v]||'未分析');
 const nap=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function scanProgressLabel(url){
   const index=scanJobs.findIndex(job=>job.url===url);
@@ -26,7 +26,10 @@ function updateScanStatus(jobs){
   if(typeof ahrefsGroups!=='undefined')renderAhrefs();
 }
 function scanEntries(rows,remaining){
-  return rows.flatMap(row=>{try{return [{url:URLTools.canonicalURL(row.url),remaining}];}catch{return [];}});
+  const byURL=new Map(scanJobs.map(job=>[job.url,job]));
+  const plan=ResourcePolicy.plan(rows.map(row=>({...byURL.get(row.url),...row})),{limit:Number($('scanHostLimit').value)});
+  $('scanPlan').textContent=`本次选取 ${plan.selected.length} 页；合并或暂缓 ${plan.skipped.length} 页（原始网址保留）。`;
+  return plan.selected.map(row=>({url:URLTools.canonicalURL(row.url),remaining}));
 }
 async function visitBlog(url,isStopped){
   const excludedResult=(reason,finalUrl=url)=>({verdict:'unknown',excluded:true,reason,finalUrl,hasCommentForm:false,captcha:false,sites:[],linkMethods:[],linkSamples:[]});
@@ -52,7 +55,7 @@ async function visitBlog(url,isStopped){
     await nap(1500);
     if(isStopped())throw Error('已停止');
     stage='正在读取评论与表单';progress();
-    const [{result:initialPage}]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:readBlogEvidence,args:[true]});
+    const initialPage=await readBlogPage(tab.id);
     if(!initialPage?.evidence)throw Error('无法读取页面证据');
     const finalReason=URLTools.searchResultReason(initialPage.url);
     if(finalReason)return excludedResult('来源页跳转到了'+finalReason,initialPage.url);
@@ -60,17 +63,20 @@ async function visitBlog(url,isStopped){
     const comments=`保存 ${page.items.length} 条评论；${page.commentCollection?.reason||''}`;
     if(isStopped())throw Error('已停止');
     let result;
+    page.evidence.qualitySample={title:page.evidence.pageTitle||'',article:page.evidence.articleSample||'',
+      comments:page.items.slice(0,30).map(item=>({text:(item.text||'').slice(0,600),links:(item.links||[]).slice(0,8)})),
+      collectedComments:page.items.length,collection:page.commentCollection||null};
     stage='正在等待 Codex CLI 判断（单次最多 100 秒）';progress();
     try{result=await discoveryRequest('draft',{mode:'assess_blog',evidence:page.evidence});}
     catch(error){error.bridgeFailure=true;throw error;}
-    let verdict=['likely_guest','login_required','unknown'].includes(result.verdict)?result.verdict:'unknown';
-    if(verdict==='likely_guest'&&(!page.evidence.forms.some(f=>f.comment&&f.website&&f.submit&&!f.captcha)||page.evidence.notices.length))verdict='unknown';
+    const verdict=commentEligibility(page.evidence,result.verdict);
+    const quality=PageQuality.assess(page.evidence,result.quality);
     const origin=new URL(page.url).hostname.replace(/^www\./,'');
     const sites=[...new Set(page.items.flatMap(item=>item.sites).flatMap(raw=>{
       try{const value=URLTools.canonicalURL(raw);return URLTools.searchResultReason(value)||new URL(value).hostname.replace(/^www\./,'')===origin?[]:[value];}catch{return [];}
     }))];
-    return {verdict,excluded:false,reason:String(result.reason||'').slice(0,300),captcha:page.evidence.forms.some(f=>f.captcha),
-      hasCommentForm:page.evidence.forms.length>0,linkMethods:page.evidence.linkMethods||[],linkSamples:page.items.flatMap(item=>item.links||[]).slice(0,50),commentCollection:page.commentCollection,embeddedComments:page.evidence.embeddedComments,sites,comments,finalUrl:URLTools.canonicalURL(page.url)};
+    return {verdict,excluded:false,reason:verdict==='link_unverified'?'发现可留言表单，未发现登录或验证码要求；提交按钮可能等待填写必填项，提交和留链效果仍待验证。':String(result.reason||'').slice(0,300),captcha:page.evidence.forms.some(f=>f.captcha),
+      topics:ResourceTopics.normalize(result.topics),quality,hasCommentForm:page.evidence.forms.length>0,frameCoverage:page.evidence.frameCoverage,formEvidence:page.evidence.forms,manualFillRequired:!page.evidence.forms.some(f=>f.comment&&f.submit&&!f.captcha&&f.website&&!f.custom&&!f.frameId),linkMethods:page.evidence.linkMethods||[],linkSamples:page.items.flatMap(item=>item.links||[]).slice(0,50),commentCollection:page.commentCollection,embeddedComments:page.evidence.embeddedComments,sites,comments,finalUrl:URLTools.canonicalURL(page.url)};
   }finally{clearInterval(timer);scanLive.delete(url);if(tab)await chrome.tabs.remove(tab.id).catch(()=>{});}
 }
 async function afterCollection(rows){
@@ -97,7 +103,7 @@ async function runDiscovery(){
         const result=await scanner.run({retryFailed,concurrency});retryFailed=false;
         if(result.stopped){scanStopped=true;break;}
         const tasks=(await chrome.storage.local.get(recursionKey))[recursionKey]||[];
-        for(const job of result.jobs){
+        for(const job of result.selected||result.jobs){
           if(job.state!=='done'||!job.remaining)continue;
           for(const site of job.sites||[]){
             if(URLTools.searchResultReason(site))continue;
@@ -134,10 +140,19 @@ async function runDiscovery(){
 }
 function initDiscovery(){
   scanner=BlogQueue.create({
+    select:jobs=>{
+      const sources=new Map(uniqueCollected().map(row=>[row.url,row]));
+      const plan=ResourcePolicy.plan(jobs.map(job=>({...sources.get(job.url),...job})),{limit:Number($('scanHostLimit').value)});
+      const allowed=new Set(plan.selected.map(row=>row.url));
+      $('scanPlan').textContent=`队列选取 ${allowed.size} 个代表页；${plan.skipped.length} 页不重复分析（历史结果和原始网址保留）。`;
+      return jobs.filter(job=>allowed.has(job.url));
+    },
     load:async()=>(await chrome.storage.local.get(scanKey))[scanKey]||[],
     save:jobs=>chrome.storage.local.set({[scanKey]:jobs}),visit:visitBlog,changed:updateScanStatus,
     lock:fn=>navigator.locks.request(scanKey,fn)
   });
+  $('scanHostLimit').value=localStorage.getItem('scanHostLimit')||'3';
+  $('scanHostLimit').onchange=()=>localStorage.setItem('scanHostLimit',$('scanHostLimit').value);
   $('scanConcurrency').value=localStorage.getItem('scanConcurrency')||'3';
   $('scanConcurrency').onchange=()=>localStorage.setItem('scanConcurrency',$('scanConcurrency').value);
   $('recursionRounds').value=localStorage.getItem('recursionRounds')||'0';

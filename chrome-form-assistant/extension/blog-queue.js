@@ -1,6 +1,6 @@
 // Durable bounded concurrent queue. Commenter URLs are saved, never recursively enqueued.
 const BlogQueue = {
-  create({load,save,visit,changed,lock}) {
+  create({load,save,visit,changed,lock,select=jobs=>jobs}) {
     let stopped=false;
     return {
       stop(){stopped=true;},
@@ -20,7 +20,8 @@ const BlogQueue = {
         stopped=false;
         return lock(async()=>{
           const jobs=await load();
-          const pending=jobs.filter(job=>job.state!=='done'&&(job.state!=='failed'||retryFailed));
+          const selected=select(jobs);
+          const pending=selected.filter(job=>job.state!=='done'&&(job.state!=='failed'||retryFailed));
           let cursor=0,writes=Promise.resolve();
           const persist=()=>{
             const snapshot=JSON.parse(JSON.stringify(jobs));
@@ -45,7 +46,7 @@ const BlogQueue = {
           const results=await Promise.allSettled(Array.from({length:Math.min(concurrency,pending.length)},worker));
           const failure=results.find(result=>result.status==='rejected');
           if(failure)throw failure.reason;
-          return {stopped,jobs};
+          return {stopped,jobs,selected};
         });
       }
     };

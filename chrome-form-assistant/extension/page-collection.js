@@ -5,11 +5,15 @@ function advanceCollection(kind){
   const caption=el=>(el.getAttribute('aria-label')||el.getAttribute('title')||el.innerText||'').trim();
   if(kind==='semrush'){
     if(!/^(sem\.3ue\.co|(?:[\w-]+\.)*semrush\.com)$/.test(location.hostname)||!location.pathname.startsWith('/analytics/backlinks/'))return {reason:'已离开 Semrush 报告'};
+    const currentParams=new URL(location.href).searchParams;
+    const required={ba_rpp:'blog',ba_mt:'active',ba_rel:'ugc'};
+    if(Object.entries(required).some(([key,value])=>currentParams.get(key)!==value))return {reason:'筛选条件发生变化，已停止翻页'};
     const candidates=[...document.querySelectorAll('button,a[rel="next"],[role="button"]')].filter(enabled).filter(el=>!el.closest('form')&&/^(next(?: page)?|下一页|下一頁)$/i.test(caption(el)));
     if(candidates.length!==1)return {reason:candidates.length?'分页按钮不唯一，已暂停':'未发现可用的下一页按钮'};
     const next=candidates[0];
     if(next.tagName==='A'){
       const u=new URL(next.href);if(u.origin!==location.origin||!u.pathname.startsWith('/analytics/backlinks/')||u.searchParams.get('q')!==new URL(location.href).searchParams.get('q'))return {reason:'分页链接与查询目标不一致'};
+      if(Object.entries(required).some(([key,value])=>u.searchParams.get(key)!==value))return {reason:'下一页未保留博客、活跃、UGC 筛选，已暂停'};
     }
     next.click();return {advanced:true};
   }
@@ -62,6 +66,7 @@ async function collectReportPages(tabId,first,recursive){
   const rows=new Map();let added=0,lastSaved;
   const read=async()=>{
     const [{result}]=await chrome.scripting.executeScript({target:{tabId},func:readSemrushReport});
+    if(result?.detail){const error=Error('翻页后筛选条件丢失，未保存该页');error.fatal=true;throw error;}
     if(result?.error||result?.target?.toLowerCase()!==first.target.toLowerCase()){
       const error=Error(result?.error||'翻页后查询目标发生变化');error.fatal=true;throw error;
     }
@@ -83,10 +88,10 @@ async function collectReportPages(tabId,first,recursive){
 }
 
 async function collectCommentPages(tabId,first,isStopped,onStage){
-  const all=new Map();let metadata;
+  const all=new Map();let metadata,latest=first;
   const read=async()=>{
-    const [{result}]=await chrome.scripting.executeScript({target:{tabId},func:readBlogEvidence,args:[true]});
-    if(!result?.items)throw Error('评论尚未加载');return result;
+    const result=await readBlogPage(tabId);
+    if(!result?.items)throw Error('评论尚未加载');latest=result;return result;
   };
   try{
     metadata=await PageCollection.run({first,read,maxPages:Number($('commentPageLimit').value),stopped:isStopped,
@@ -97,7 +102,7 @@ async function collectCommentPages(tabId,first,isStopped,onStage){
         await saveBlogComments(page);onStage(`已保存 ${count} 页/批评论，累计 ${all.size} 条`);
       }});
   }catch(error){metadata={reason:'评论采集暂停：'+error.message};}
-  const methods=new Set(first.evidence?.linkMethods||[]);
+  const methods=new Set(latest.evidence?.linkMethods||[]);
   if([...all.values()].some(item=>item.links?.length))methods.add('existing_body_links');
-  return {...first,evidence:{...first.evidence,linkMethods:[...methods]},items:[...all.values()],commentCollection:metadata};
+  return {...latest,evidence:{...latest.evidence,linkMethods:[...methods]},items:[...all.values()],commentCollection:metadata};
 }

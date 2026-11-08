@@ -145,7 +145,8 @@ async function saveCollected(raw, rows) {
       let url;try { url=URLTools.canonicalURL(item.url); }catch {continue;}
       if (url===website) continue;
       const previous = links.get(url);
-      links.set(url,{...previous,url,title:item.title || previous?.title || '',
+      const kinds=new Set([...(previous?.resourceKinds|| (previous?[ResourcePolicy.isAuthor(previous)?'author':'source']:[])),...(item.resourceKinds||[ResourcePolicy.isAuthor(item)?'author':'source'])]);
+      links.set(url,{...previous,url,resourceKinds:[...kinds],title:ResourcePolicy.isAuthor(item)&&previous&&!ResourcePolicy.isAuthor(previous)?previous.title:item.title || previous?.title || '',
         ...(item.riskEvidence ? {riskEvidence:item.riskEvidence} : {})});
       if (!previous) added++;
     }
@@ -185,20 +186,26 @@ function discovery(action) {
 }
 function semrushStart(input) {
   if (!input) return null;
-  const url = new URL('https://sem.3ue.co/analytics/backlinks/pages/');
+  let url = new URL('https://sem.3ue.co/analytics/backlinks/backlinks/');
   let target = input;
   if (/^https?:\/\//i.test(input)) {
     const supplied = new URL(input);
     if (supplied.origin === url.origin && /^\/analytics\/backlinks\/(pages|backlinks)\/?$/i.test(supplied.pathname)) {
       target = supplied.searchParams.get('q') || '';
-      const session = supplied.searchParams.get('__gmitm');
-      if(session)url.searchParams.set('__gmitm',session);
+      url = new URL(supplied.href);
+      url.pathname='/analytics/backlinks/backlinks/';
+      url.hash='';
     } else target = new URL(URLTools.canonicalURL(input)).hostname;
   }
   if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(target))
     throw Error('请输入有效域名，例如 pixverse.ai，或完整 Semrush 镜像报告链接。');
   url.searchParams.set('q',target.toLowerCase());
   url.searchParams.set('searchType','domain');
+  url.searchParams.delete('page');
+  url.searchParams.set('ba_rpp','blog');
+  url.searchParams.set('ba_mt','active');
+  url.searchParams.set('ba_rel','ugc');
+  if(!url.searchParams.has('sort_field'))url.searchParams.set('sort_field','firsttime');
   return {url:url.href,target:target.toLowerCase()};
 }
 $('captureSemrush').onclick=()=>{
@@ -280,7 +287,7 @@ async function saveBlogComments(page){
         const href=URLTools.canonicalURL(raw);
         if(URLTools.searchResultReason(href))return [];
         if(new URL(href).hostname.replace(/^www\./,'')===source.hostname.replace(/^www\./,''))return [];
-        sites.set(href,{url:href,title:'评论者公开网址（待验证）'});return [href];
+        sites.set(href,{url:href,title:'评论者公开网址（待验证）',resourceKinds:['author']});return [href];
       }catch{return [];}
     })
   }));

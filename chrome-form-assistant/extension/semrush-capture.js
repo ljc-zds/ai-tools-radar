@@ -7,11 +7,13 @@ function readSemrushReport() {
     return {error:'请打开 Semrush Backlinks 明细页。'};
   const params = new URLSearchParams(location.search);
   const target = params.get('q') || '';
-  if (/^\/analytics\/backlinks\/pages\/?$/i.test(location.pathname)) {
-    if (!target) return {error:'Indexed Pages 报告缺少查询目标。'};
-    const detail = new URL('/analytics/backlinks/backlinks/',location.origin);
-    for (const key of ['q','searchType']) if(params.has(key)) detail.searchParams.set(key,params.get(key));
-    if(location.hostname==='sem.3ue.co' && params.has('__gmitm'))detail.searchParams.set('__gmitm',params.get('__gmitm'));
+  const required={ba_rpp:'blog',ba_mt:'active',ba_rel:'ugc'};
+  if (/^\/analytics\/backlinks\/pages\/?$/i.test(location.pathname)||Object.entries(required).some(([key,value])=>params.get(key)!==value)) {
+    if (!target) return {error:'报告缺少查询目标。'};
+    const detail = new URL(location.href);
+    detail.pathname='/analytics/backlinks/backlinks/';
+    detail.searchParams.delete('page');
+    for(const [key,value] of Object.entries(required))detail.searchParams.set(key,value);
     return {detail:detail.href};
   }
   const visible = el => el.getClientRects().length && getComputedStyle(el).visibility === 'visible';

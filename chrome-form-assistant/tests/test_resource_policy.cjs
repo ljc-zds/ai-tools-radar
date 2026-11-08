@@ -1,0 +1,15 @@
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
+const c={URL};vm.createContext(c);vm.runInContext(fs.readFileSync(path.join(__dirname,'../extension/url-utils.js'),'utf8')+'\nglobalThis.policy=ResourcePolicy',c);const p=c.policy;
+const base='https://journal.test/index.php/conf/2022/comment/view/1';
+const rows=Array.from({length:191},(_,i)=>({url:base+'/'+i}));
+rows.push({url:'https://journal.test/article-b'},{url:'https://journal.test/article-c'},{url:'https://journal.test/article-d'}, {url:'https://nl.search.yahoo.com/search?p=test'}, {url:'https://author.test/',title:'评论者公开网址（待验证）'});
+const plan=p.plan(rows);assert.equal(plan.selected.length,3);assert.equal(plan.skipped.length,193);assert.equal(p.group(rows.slice(0,191)).length,1);
+assert.equal(p.family(base+'/0/7'),p.family(base+'/4144'));assert.equal(p.family(base.replace('/comment/','/%20comment/')+'/0/0'),p.family(base));
+assert.notEqual(p.family(base),p.family(base.replace('/view/1','/view/2')));
+assert.equal(p.family('https://blog.test/post/comment-page-3/?cpage=3'),p.family('https://blog.test/post/'));
+assert.notEqual(p.family('https://blog.test/article-a'),p.family('https://blog.test/article-b'));
+assert.equal(p.isAuthor({title:'评论者公开网址（待验证）',resourceKinds:['source','author']}),false);
+assert.equal(p.plan(rows,{limit:1}).selected.length,1);assert.equal(p.plan(rows,{limit:20}).selected.length,4);
+const priority=p.plan([{url:'https://priority.test/a'},{url:'https://priority.test/b',hasCommentForm:true}],{limit:1});assert.equal(priority.selected[0].url,'https://priority.test/b');
+vm.runInContext(fs.readFileSync(path.join(__dirname,'../extension/blog-queue.js'),'utf8')+'\nglobalThis.queue=BlogQueue',c);
+(async()=>{let data=rows.map(r=>({...r,state:'pending'})),visited=[];const q=c.queue.create({load:async()=>structuredClone(data),save:async j=>data=structuredClone(j),visit:async url=>{visited.push(url);return{verdict:'unknown'};},changed:()=>{},lock:fn=>fn(),select:j=>p.plan(j).selected});await q.run({concurrency:3});assert.equal(visited.length,3);assert.equal(data.length,196);await q.run();assert.equal(visited.length,3,'resume never fans out beyond host limit');console.log('PASS: topic grouping, distinct article preservation, host cap, author/search exclusion, legacy queue resume and raw data retention');})().catch(e=>{console.error(e);process.exitCode=1;});

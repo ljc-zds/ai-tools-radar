@@ -36,3 +36,40 @@
   }
   globalThis.URLTools = Object.freeze({canonicalURL,searchResultReason});
 })();
+
+// Scheduling/grouping identities are separate from stored URLs and submission ledger keys.
+const ResourcePolicy={
+  isAuthor(row){return row.resourceKinds?.includes('source')?false:row.resourceKinds?.includes('author')||row.resourceKind==='author'||row.title==='评论者公开网址（待验证）';},
+  host(raw){return new URL(raw).hostname.toLowerCase().replace(/^www\./,'');},
+  family(raw){
+    const u=new URL(URLTools.canonicalURL(raw));
+    u.pathname=u.pathname.replace(/\/(?:%20)+comment\/view\//i,'/comment/view/');
+    const thread=u.pathname.match(/^(.*\/comment\/view\/\d+)(?:\/|$)/i);
+    if(thread)return this.host(u.href)+thread[1];
+    u.pathname=u.pathname.replace(/\/comment-page-\d+\/?$/i,'/');u.searchParams.delete('cpage');
+    return this.host(u.href)+u.pathname+u.search;
+  },
+  group(rows){
+    const groups=new Map();
+    for(const row of rows){const key=this.family(row.url);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+    return [...groups.values()];
+  },
+  plan(rows,{limit=3}={}){
+    if(!Number.isInteger(limit)||limit<1||limit>20)throw Error('同站最多分析数量须为 1–20。');
+    const selected=[],skipped=[],families=new Set(),counts=new Map();
+    const priority=row=>row.verdict==='likely_guest'?2:row.hasCommentForm?1:0;
+    for(const row of [...rows].sort((a,b)=>priority(b)-priority(a))){
+      let reason='';
+      try{
+        const host=this.host(row.url),family=this.family(row.url);
+        if(this.isAuthor(row))reason='站长网址，仅作为发现线索';
+        else if(URLTools.searchResultReason(row.url))reason='搜索结果页';
+        else if(families.has(family))reason='同一文章的评论详情/分页';
+        else if((counts.get(host)||0)>=limit)reason='达到同站分析上限';
+        else{families.add(family);counts.set(host,(counts.get(host)||0)+1);selected.push(row);}
+      }catch{reason='无效网址';}
+      if(reason)skipped.push({url:row.url,reason});
+    }
+    return {selected,skipped};
+  }
+};

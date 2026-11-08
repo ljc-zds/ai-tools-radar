@@ -28,7 +28,7 @@ function report(columns,values) {
   const row={children:cells,getAttribute:()=> 'row'};
   const table={getClientRects:()=>[{}],querySelectorAll:q=>q.startsWith('th')?headers:[headerRow,row]};
   scope.document={body:table,querySelectorAll:()=>[table]};
-  scope.location=new URL('https://sem.3ue.co/analytics/backlinks/backlinks/?q=target.test');
+  scope.location=new URL('https://sem.3ue.co/analytics/backlinks/backlinks/?q=target.test&ba_rpp=blog&ba_mt=active&ba_rel=ugc');
   scope.getComputedStyle=()=>({visibility:'visible'});
   return scope.readSemrushReport().rows[0];
 }
@@ -43,7 +43,7 @@ const panel=fs.readFileSync(path.join(root,'sidepanel.js'),'utf8');
 const save=panel.slice(panel.indexOf('async function saveCollected('),panel.indexOf('async function discoveryRequest('));
 let stored=[];
 scope.ahrefsGroups=new Map();scope.ahrefsStorageKey='test';
-scope.URLTools={canonicalURL:value=>new URL(value).href};
+vm.runInContext(fs.readFileSync(path.join(root,'url-utils.js'),'utf8'),scope);
 scope.navigator={locks:{request:async(key,fn)=>fn()}};
 scope.chrome={storage:{local:{set:async value=>{stored=value.test;}}}};
 scope.loadAhrefsGroups=async()=>{scope.ahrefsGroups.clear();for(const g of stored)scope.ahrefsGroups.set(g.target,g.links);};
@@ -58,5 +58,8 @@ vm.runInContext(save,scope);
   await scope.saveCollected('target.test',[{url:'https://source.test',title:'Updated'}]);
   assert.equal(risk.classify(stored[0].links[0]),'spam');
   assert.equal(stored[0].links[0].title,'Updated');
+  await scope.saveCollected('target.test',[{url:'https://source.test',title:'评论者公开网址（待验证）',resourceKinds:['author']}]);
+  assert.equal(stored[0].links[0].title,'Updated');
+  assert.deepEqual([...stored[0].links[0].resourceKinds].sort(),['author','source']);
   console.log('PASS: risk boundaries, filters, report parsing, deduplication and persistence');
 })().catch(error=>{console.error(error);process.exitCode=1;});
